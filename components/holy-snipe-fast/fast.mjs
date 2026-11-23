@@ -12,6 +12,9 @@ import {createHash} from 'node:crypto';
 import { canonicalTrade, eventKey, formatAlert, normalizeAddress } from './identity.mjs';
 import { cacheKeys, findCachedMetadata, lookupGammaMetadata, mergeMetadata, rawMetadata } from './metadata.mjs';
 import { recoveryController } from './recovery.mjs';
+import {createDeliveryClaimGuard} from './delivery-claim.mjs';
+import {createFastShutdown} from './shutdown.mjs';
+import {isRetryableSqliteLock} from './sqlite-lock.mjs';
 import { telegramRequest,deliveryDecision } from './telegram-transport.mjs';
 import {createTelegramCircuit} from './telegram-circuit.mjs';
 import {createTrace,projection,parseReason} from './trace.mjs';
@@ -74,12 +77,17 @@ if (process.argv[2] === 'test-owner1') {
 } else if (process.argv.length > 2) {
   throw Error('invalid_command');
 } else {
+  const ownerIds = (process.env.OWNER_TELEGRAM_USER_IDS ?? '').split(',')
+    .map(id => id.trim()).filter(id => /^\d+$/.test(id)).map(Number)
+    .filter(id => Number.isSafeInteger(id) && id > 0);
+  if (!ownerIds.length) throw Error('owners_not_configured');
+  const ownerPlaceholders = ownerIds.map(() => '?').join(',');
   await verifyBot();
   const db = new Database(DB_PATH);
   const trace=createTrace(ROOT,Database,{policy:'SEND_ONCE_OWNER_SCOPE_RECOVERY_OFF'});
   const boundaryStats={canary:true,overlap_ms:2000,optimality_proven:false,overlap_accepted:0,stale_dropped:0};
+  db.pragma('busy_timeout = 5000');
   db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 1000');
   db.exec(`
     CREATE TABLE IF NOT EXISTS cohort (
       wallet TEXT NOT NULL, chat_id INTEGER NOT NULL, notify_from_ts INTEGER NOT NULL,
@@ -145,9 +153,8 @@ if (process.argv[2] === 'test-owner1') {
   });
   const claim=(now,allowNew)=>{
     const stateStarted=performance.now();
-    const row=claimTransaction(now,allowNew,stateStarted);
-    if(row&&resilientMode&&dualAllowed)try{directGate.checkAge(stateStarted);}
-    catch{stopFast('RTDS_CLAIM_STATE_TOO_STALE');return null;}
+    sendOnce.refreshRollback();
+    const row=claimTransaction.immediate(now,allowNew,stateStarted);
     return row&&resilientMode&&dualAllowed?{...row,directStateStartedMs:stateStarted}:row;
   };
   const finish = db.prepare(`UPDATE deliveries SET state=?,claim_token=NULL,http_status=?,last_error=?,
@@ -218,10 +225,7 @@ if (process.argv[2] === 'test-owner1') {
     JOIN tracked_accounts a ON a.proxy_address=s.proxy_address
     LEFT JOIN access_grants g ON g.telegram_user_id=u.telegram_user_id
     WHERE u.chat_type='private' AND u.telegram_chat_id=u.telegram_user_id
-      AND (g.telegram_user_id IS NOT NULL OR u.telegram_user_id IN (${process.env.OWNER_TELEGRAM_USER_IDS?.split(',').map(() => '?').join(',') || 'NULL'}))`);
-  const ownerIds = (process.env.OWNER_TELEGRAM_USER_IDS || '').split(',').map(Number)
-    .filter(id => Number.isSafeInteger(id) && id > 0);
-  if (!ownerIds.length) throw Error('owners_not_configured');
+      AND (g.telegram_user_id IS NOT NULL OR u.telegram_user_id IN (${ownerPlaceholders})))`);
   const recovery=recoveryController(db,{root:ROOT,ownerIds,enabledDirect:()=>recoveryEnabled&&!!enabledAt(),getSendOnce:()=>sendOnce,traceRecovery:(stage,value,chat,key,raw)=>{
     if(stage==='begin'){const id=trace.begin(value,'REST_RECOVERY','TRADE',JSON.stringify(value));trace.stage(id,'REST_RECOVERY_ACCEPTED',{source:'REST_RECOVERY'});return id;}
     trace.queue(value,key,chat,projection(raw,'REST_RECOVERY','TRADE'),true);
@@ -270,7 +274,7 @@ if (process.argv[2] === 'test-owner1') {
   let dualAllowed=false,scopeFingerprint=null;const dualPairs=new Map();
   let capturedBridgeAdmissions=null,bridge=null,bridgeState='OFF';
   const ingressControl=createIngressControl({mono:()=>performance.now(),sink:row=>console.error(JSON.stringify({rtds_ingress:row}))});
-  function currentScopeSafe(){return dualAllowed&&!fs.existsSync(path.join(ROOT,'SEND_ONCE_ROLLBACK'));}
+  function currentScopeSafe(){return dualAllowed&&!sendOnce.refreshRollback();}
   if(resilientMode){
     const bytes=fs.readFileSync(path.join(ROOT,'dual-rtds-scope.json'));
     const expected=process.env.FAST_DUAL_SCOPE_SHA256;
@@ -297,7 +301,7 @@ if (process.argv[2] === 'test-owner1') {
   if(resilientMode)ensureIngressIndexes(db);
   const directGate=createDirectAdmissionGate({db,sendOnce,
     readCurrentPair:(wallet,recipient)=>activeSubscriptions.all(...ownerIds).find(r=>normalizeAddress(r.wallet)===wallet&&r.chat_id===recipient),
-    isEnabled:()=>!!enabledAt()&&!fs.existsSync(path.join(ROOT,'SEND_ONCE_ROLLBACK'))&&(!resilientMode||currentScopeSafe()),
+    isEnabled:()=>!!enabledAt()&&!sendOnce.refreshRollback()&&(!resilientMode||dualAllowed),
     disable:reason=>stopFast(reason),allowNewPairHistoryBlock:resilientMode});
   const bridgeGate=(...args)=>{
     const admission=directGate(...args);
@@ -517,8 +521,43 @@ if (process.argv[2] === 'test-owner1') {
     ws.addEventListener('close', () => reconnect(gen,'close'));
   }
   const telegramCircuit=createTelegramCircuit();
+  const claimGuard=createDeliveryClaimGuard(db,{onClaimLost:row=>{
+    if(row.isRestRecovery)recovery.stop('RECOVERY_CLAIM_LOST');
+    else stopFast('delivery_claim_lost');
+  }});
+  function beforeTelegramRequest(row) {
+    if(!active||!enabledAt())return 'FAST_DISABLED_BEFORE_SEND';
+    console.log(`[telegram] send_started_at=${new Date(row.sendStartedAtMs).toISOString()} rtds_received_at=${new Date(row.first_seen_at_ms).toISOString()} recovery=${row.recovery}`);
+    trace.delivery(row,'SEND_ATTEMPT',{send_started_ms:row.sendStartedAtMs,source:row.isRestRecovery?'REST_RECOVERY':'FAST_DIRECT'});
+    if(row.directStateStartedMs!==undefined){
+      const current=directGate.beforeSend(row,row.directStateStartedMs);
+      if(!current.allow){
+        trace.delivery(row,'SEND_SKIPPED',{reason:'RTDS_FINAL_'+current.reason});
+        if(current.reason!=='SUBSCRIPTION_INACTIVE'&&!isRetryableSqliteLock({code:current.reason}))stopFast('RTDS_FINAL_'+current.reason);
+        return current.reason;
+      }
+    }
+    if(!active||!enabledAt())return 'FAST_DISABLED_BEFORE_SEND';
+    if(!recovery.beforeSend(row)){
+      trace.delivery(row,'SEND_SKIPPED',{reason:'RECOVERY_BEFORE_SEND_REJECT'});
+      return 'RECOVERY_BEFORE_SEND_REJECT';
+    }
+    if(row.directStateStartedMs!==undefined)try{directGate.checkAge(row.directStateStartedMs);}
+    catch{stopFast('RTDS_FINAL_STATE_TOO_STALE');return 'STATE_TOO_STALE';}
+  }
+  function requestTelegram(row) {
+    const result=telegram('sendMessage',{chat_id:String(row.chat_id),text:row.message_html,
+      parse_mode:'HTML',disable_web_page_preview:true},8000,row.isRestRecovery);
+    // Write recovery attempt evidence only after handing the request to transport.
+    try{recovery.markSendStarted(row);}
+    catch{
+      console.error('[recovery] send_audit_failed');
+      try{recovery.stop('RECOVERY_SEND_AUDIT_ERROR');}catch{stopFast('RECOVERY_STOP_FAILED');}
+    }
+    return result;
+  }
   async function sendDue() {
-    if (sending || !telegramCircuit.ready()) return;
+    if (sending || !claimGuard.flush() || !active || !telegramCircuit.ready()) return;
     const row = claim(Date.now(),!!enabledAt());
     if (!row) {
       sending=true;
@@ -526,49 +565,35 @@ if (process.argv[2] === 'test-owner1') {
       return;
     }
     sending = true;
-    console.log(`[telegram] send_started_at=${new Date(row.sendStartedAtMs).toISOString()} rtds_received_at=${new Date(row.first_seen_at_ms).toISOString()} recovery=${row.recovery}`);
     try {
-      if(!recovery.beforeSend(row)){trace.delivery(row,'SEND_SKIPPED',{reason:'RECOVERY_BEFORE_SEND_REJECT'});return;}
-      trace.delivery(row,'SEND_ATTEMPT',{send_started_ms:row.sendStartedAtMs,source:row.isRestRecovery?'REST_RECOVERY':'FAST_DIRECT'});
-      if(resilientMode&&dualAllowed){
-        const current=directGate.beforeSend(row,row.directStateStartedMs);
-        if(!current.allow){
-          trace.delivery(row,'SEND_SKIPPED',{reason:'RTDS_FINAL_'+current.reason});
-          if(current.reason==='SUBSCRIPTION_INACTIVE'){
-            const cancelled=db.prepare(`UPDATE deliveries SET state='CANCELLED_SUBSCRIPTION',claim_token=NULL,next_at_ms=0,last_error='subscription_removed' WHERE event_key=? AND chat_id=? AND state='SENDING' AND claim_token=?`).run(row.event_key,row.chat_id,row.claimToken);
-            if(cancelled.changes!==1)stopFast('RTDS_CANCEL_CLAIM_CHANGED');
-          }else stopFast('RTDS_FINAL_'+current.reason);
-          return;
+      await claimGuard.run(row,beforeTelegramRequest,requestTelegram,(result,settled)=>{
+        const transportHealth=telegramCircuit.observe(result);
+        if(result.kind==='AMBIGUOUS')console.error('[telegram_circuit] '+JSON.stringify(transportHealth));
+        const now = Date.now();
+        const {state,next,error,possible,delivered}=deliveryDecision(result,row,now);
+        if (result.kind === 'OK') { stats.delivered++; }
+        else if (result.kind === 'AMBIGUOUS') {
+          stats.deliveryUnknown++;
+          if(!row.isRestRecovery) {
+            ambiguousAt.push(now);
+            while (ambiguousAt[0] < now-3600000) ambiguousAt.shift();
+            // UNKNOWN is terminal; pause only consecutive transport failures, keep intake active.
+          }
+        } else if(state==='FAILED_FINAL'){stats.confirmedTelegramFailures++;}
+        const updated=finish.run(state,result.status,error,next,possible,delivered,row.event_key,row.chat_id,row.claimToken);
+        if (updated.changes === 1) {
+          settled();
+          sendOnce.observeAck(row,result);
         }
-      }
-      const result = await telegram('sendMessage', { chat_id:String(row.chat_id),text:row.message_html,
-        parse_mode:'HTML',disable_web_page_preview:true },8000,row.isRestRecovery);
-      const transportHealth=telegramCircuit.observe(result);
-      if(result.kind==='AMBIGUOUS')console.error('[telegram_circuit] '+JSON.stringify(transportHealth));
-      const now = Date.now();
-      const {state,next,error,possible,delivered}=deliveryDecision(result,row,now);
-      if (result.kind === 'OK') { stats.delivered++; }
-      else if (result.kind === 'AMBIGUOUS') {
-        stats.deliveryUnknown++;
-        if(!row.isRestRecovery) {
-          ambiguousAt.push(now);
-          while (ambiguousAt[0] < now-3600000) ambiguousAt.shift();
-          // UNKNOWN is terminal; pause only consecutive transport failures, keep intake active.
-        }
-      } else if(state==='FAILED_FINAL'){stats.confirmedTelegramFailures++;}
-      const updated=finish.run(state,result.status,error,next,possible,delivered,row.event_key,row.chat_id,row.claimToken);
-      sendOnce.observeAck(row,result);
-      trace.delivery(row,result.kind==='OK'?'TELEGRAM_ACK':result.kind==='AMBIGUOUS'?'DELIVERY_UNKNOWN':'SEND_ERROR',{http_status:result.status,telegram_ok:result.value?.ok??null,message_id:result.value?.result?.message_id??null,recipient_matches:result.kind==='OK'?String(result.value.result.chat?.id)===String(row.chat_id):null,reason:result.reason??null,error_code:result.error_code??null,final_delivery_state:state,delivery_row_updated:updated.changes===1,finished_ms:now});
-      if (updated.changes !== 1) {
-        if(row.isRestRecovery)recovery.stop('RECOVERY_CLAIM_LOST');else stopFast('delivery_claim_lost');
-      }
-      const tag=x=>createHmac('sha256',ACK_SALT).update(String(x)).digest('hex');
-      fs.appendFileSync(ACK_FILE,JSON.stringify({run_id:ACK_RUN_ID,at_ms:now,event:tag(row.event_key),recipient:tag(row.chat_id),attempt:row.attempts+1,state,kind:result.kind,http_status:result.status,error_code:result.error_code??null,reason:result.reason??null,retry_after_ms:result.retry_after_ms??null,ack_ok:result.value?.ok===true,message_id_present:Number.isSafeInteger(result.value?.result?.message_id),receipt:result.kind==='OK'?tag(row.chat_id+'|'+result.value.result.message_id):null,recipient_matches:result.kind==='OK'?String(result.value.result.chat?.id)===String(row.chat_id):null,source:row.isRestRecovery?'REST_RECOVERY':'FAST_DIRECT',first_seen_ms:row.first_seen_at_ms,source_timestamp:row.source_timestamp,send_started_ms:row.sendStartedAtMs,latency_ms:Math.max(0,now-row.source_timestamp*1000)})+'\n',{mode:0o600});
-      if(row.isRestRecovery) recovery.afterSend(row,{kind:result.kind,status:result.status,
-        message_id:result.value?.result?.message_id??null,telegram_ok:result.value?.ok===true,delivery_row_updated:updated.changes===1,
-        recipient_matches:result.kind==='OK'?String(result.value?.result?.chat?.id)===String(row.chat_id):null},state,delivered);
-      if (result.kind === 'OK') console.log(`[telegram] success_at=${new Date(now).toISOString()} end_to_end_ms=${Math.max(0,now-row.source_timestamp*1000)} duplicate_suppressed=${stats.duplicates}`);
-      if (result.kind !== 'OK') console.error(`[telegram] state=${state} status=${result.status ?? 'unknown'} reason=${result.reason??'UNCLASSIFIED'}`);
+        trace.delivery(row,result.kind==='OK'?'TELEGRAM_ACK':result.kind==='AMBIGUOUS'?'DELIVERY_UNKNOWN':'SEND_ERROR',{http_status:result.status,telegram_ok:result.value?.ok??null,message_id:result.value?.result?.message_id??null,recipient_matches:result.kind==='OK'?String(result.value.result.chat?.id)===String(row.chat_id):null,reason:result.reason??null,error_code:result.error_code??null,final_delivery_state:state,delivery_row_updated:updated.changes===1,finished_ms:now});
+        const tag=x=>createHmac('sha256',ACK_SALT).update(String(x)).digest('hex');
+        fs.appendFileSync(ACK_FILE,JSON.stringify({run_id:ACK_RUN_ID,at_ms:now,event:tag(row.event_key),recipient:tag(row.chat_id),attempt:row.attempts+1,state,kind:result.kind,http_status:result.status,error_code:result.error_code??null,reason:result.reason??null,retry_after_ms:result.retry_after_ms??null,ack_ok:result.value?.ok===true,message_id_present:Number.isSafeInteger(result.value?.result?.message_id),receipt:result.kind==='OK'?tag(row.chat_id+'|'+result.value.result.message_id):null,recipient_matches:result.kind==='OK'?String(result.value.result.chat?.id)===String(row.chat_id):null,source:row.isRestRecovery?'REST_RECOVERY':'FAST_DIRECT',first_seen_ms:row.first_seen_at_ms,source_timestamp:row.source_timestamp,send_started_ms:row.sendStartedAtMs,latency_ms:Math.max(0,now-row.source_timestamp*1000)})+'\n',{mode:0o600});
+        if(row.isRestRecovery) recovery.afterSend(row,{kind:result.kind,status:result.status,
+          message_id:result.value?.result?.message_id??null,telegram_ok:result.value?.ok===true,delivery_row_updated:updated.changes===1,
+          recipient_matches:result.kind==='OK'?String(result.value?.result?.chat?.id)===String(row.chat_id):null},state,delivered);
+        if (result.kind === 'OK') console.log(`[telegram] success_at=${new Date(now).toISOString()} end_to_end_ms=${Math.max(0,now-row.source_timestamp*1000)} duplicate_suppressed=${stats.duplicates}`);
+        if (result.kind !== 'OK') console.error(`[telegram] state=${state} status=${result.status ?? 'unknown'} reason=${result.reason??'UNCLASSIFIED'}`);
+      });
     } catch(e) {
       trace.delivery(row,'SEND_EXCEPTION',{reason:'SEND_WORKER_EXCEPTION'});
       if(row.isRestRecovery)recovery.stop('RECOVERY_SEND_WORKER_ERROR');else throw e;
@@ -614,7 +639,11 @@ if (process.argv[2] === 'test-owner1') {
   }else connect();
   const menuTask = bot.start({ onStart: () => console.log('[menu] polling_active') })
     .catch(() => { console.error('[menu] polling_failed'); stopFast('menu_polling_failed'); });
-  const worker=setInterval(() => { void sendDue().catch(() => stopFast('send_worker_error')); },250);
+  const worker=setInterval(() => {
+    void sendDue().catch(error => {
+      if(!isRetryableSqliteLock(error))stopFast('send_worker_error');
+    });
+  },250);
   const watchdog=setInterval(() => {
     if(resilientMode)return;
     const now=Date.now();
@@ -633,8 +662,8 @@ if (process.argv[2] === 'test-owner1') {
     if (delta>0) console.log(`[rtds] RTDS_OTHER_PARTY count=${delta}`);
   },60000);
   health();
-  async function shutdown() {
-    active=false; clearInterval(worker);clearInterval(watchdog);clearInterval(reporter);clearInterval(diagnostics);clearInterval(redeemPoller);
+  const shutdown=createFastShutdown([worker,watchdog,reporter,diagnostics,redeemPoller],async()=>{
+    active=false;
     await redeem.stop();
     try { bot.stop(); } catch {}
     if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -642,10 +671,19 @@ if (process.argv[2] === 'test-owner1') {
     const deadline=Date.now()+10000;
     await Promise.race([menuTask,new Promise(resolve=>setTimeout(resolve,3000))]);
     while (sending && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,50));
-    if (sending) stopFast('shutdown_send_unresolved');
+    if (sending || !claimGuard.flush()) stopFast('shutdown_send_unresolved');
     clearInterval(peerTick);peerA?.stop('FAST_SHUTDOWN');bridge?.close();
     recovery.close();trace.close();health(true);db.close();
+  });
+  let exiting=false;
+  function onSignal(){
+    if(exiting)return;
+    exiting=true;
+    void shutdown().then(()=>process.exit(0),()=>{
+      console.error('[fast] shutdown_failed');
+      process.exit(1);
+    });
   }
-  process.once('SIGTERM', () => { void shutdown().then(()=>process.exit(0)); });
-  process.once('SIGINT', () => { void shutdown().then(()=>process.exit(0)); });
+  process.on('SIGTERM',onSignal);
+  process.on('SIGINT',onSignal);
 }

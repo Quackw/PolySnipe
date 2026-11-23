@@ -1,14 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';import os from 'node:os';import path from 'node:path';
-import {DatabaseSync} from 'node:sqlite';
+import Database from 'better-sqlite3';
 import {createSendOnce} from '../holy-snipe-fast/send-once.mjs';
 import {eventKey} from '../holy-snipe-fast/identity.mjs';
 import {createDirectAdmissionGate} from './fast-direct-gate.mjs';
 const wallet=n=>'0x'+String(n).padStart(40,'0');
 function fixture({dynamicProtected=false}={}){
- const root=fs.mkdtempSync(path.join(os.tmpdir(),'rtds-gate-')),db=new DatabaseSync(':memory:');let savepoint=0,m=0,reads=0,jumpAt=Infinity,jump=0,disabled=null,active=true;
- db.transaction=fn=>(...args)=>{const nested=db.isTransaction,name='test_nested_'+(++savepoint);db.exec(nested?'SAVEPOINT '+name:'BEGIN');try{const r=fn(...args);db.exec(nested?'RELEASE '+name:'COMMIT');return r;}catch(e){db.exec(nested?'ROLLBACK TO '+name:'ROLLBACK');if(nested)db.exec('RELEASE '+name);throw e;}};
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'rtds-gate-')),db=new Database(':memory:');let m=0,reads=0,jumpAt=Infinity,jump=0,disabled=null,active=true;
  db.exec("CREATE TABLE deliveries(event_key TEXT,chat_id INTEGER,wallet TEXT,source_timestamp INTEGER,first_seen_at_ms INTEGER,message_html TEXT,state TEXT DEFAULT 'PENDING',next_at_ms INTEGER,delivered_at_ms INTEGER,claim_token TEXT,PRIMARY KEY(event_key,chat_id))");
  const wallets=Array.from({length:6},(_,i)=>wallet(i+1));fs.writeFileSync(path.join(root,'send-once-canary.json'),JSON.stringify({version:2,start_ms:1,subscriptions:wallets.map(wallet=>({wallet,recipient:42}))}));
  const sendOnce=createSendOnce(db,{root,ownerIds:[42],recipientMap:new Map(wallets.map(w=>[w,[{chat_id:42,notify_from_ts:0}]])),insert:db.prepare('INSERT OR IGNORE INTO deliveries(event_key,chat_id,wallet,source_timestamp,first_seen_at_ms,message_html,next_at_ms) VALUES(?,?,?,?,?,?,?)'),dynamicProtected});

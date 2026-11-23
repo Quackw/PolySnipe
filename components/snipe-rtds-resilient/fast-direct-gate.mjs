@@ -2,6 +2,7 @@
 // Called only with the existing FAST writer and the existing SEND-ONCE owner.
 import {performance} from 'node:perf_hooks';
 import {userActionKey,userActionIdentity} from '../holy-snipe-fast/identity.mjs';
+import {isRetryableSqliteLock} from '../holy-snipe-fast/sqlite-lock.mjs';
 export const DIRECT_STATE_LIMIT_MS=2000;
 export function createDirectAdmissionGate({db,sendOnce,readCurrentPair,isEnabled,disable,allowNewPairHistoryBlock=false,mono=()=>performance.now()}){
  const age=start=>{const elapsed=mono()-start;if(!Number.isFinite(elapsed)||elapsed<0||elapsed>DIRECT_STATE_LIMIT_MS)throw Error('STATE_TOO_STALE');return elapsed;};
@@ -20,6 +21,7 @@ export function createDirectAdmissionGate({db,sendOnce,readCurrentPair,isEnabled
  const admit=function(trade,recipient,fillKey,traceId,html,nextAt,seenAt){
   const started=mono();let begun=false,committed=false;
   try{
+   sendOnce.refreshRollback();
    db.exec('BEGIN IMMEDIATE');begun=true;age(started);
    if(!isEnabled()||!sendOnce.applies(trade.wallet,recipient))throw Error('STRICT_ACTION_PROTECTION_REQUIRED');
    const pair=readCurrentPair(trade.wallet,recipient);
@@ -44,6 +46,7 @@ export function createDirectAdmissionGate({db,sendOnce,readCurrentPair,isEnabled
    age(started);db.exec('COMMIT');begun=false;committed=true;const stateAge=age(started);return {...result,state_age_ms:stateAge};
   }catch(error){
    if(begun)try{db.exec('ROLLBACK');}catch{}
+   if(isRetryableSqliteLock(error))return {kind:'BLOCKED',reason:error.code,committed};
    // A post-commit overrun preserves the reservation but disables admissions and
    // sender claims. Never clear history or fall back to fill-level deduplication.
    disable('RTDS_DIRECT_ADMISSION_SAFETY_STOP');
@@ -72,6 +75,7 @@ export function createDirectAdmissionGate({db,sendOnce,readCurrentPair,isEnabled
  admit.beforeSend=function(row,started){
   let begun=false;
   try{
+   sendOnce.refreshRollback();
    age(started);db.exec('BEGIN IMMEDIATE');begun=true;age(started);
    if(!isEnabled()||!sendOnce.applies(row.wallet,row.chat_id))throw Error('STRICT_ACTION_PROTECTION_REQUIRED');
    const pair=readCurrentPair(row.wallet,row.chat_id);
@@ -90,7 +94,8 @@ export function createDirectAdmissionGate({db,sendOnce,readCurrentPair,isEnabled
    return {allow:true,state_age_ms:age(started)};
   }catch(error){
    if(begun)try{db.exec('ROLLBACK');}catch{}
-   // The existing claim/reservation stays in place. No uncertain send is retried.
+   if(isRetryableSqliteLock(error))return {allow:false,reason:error.code};
+   // The sender resolves this claim without removing its action reservation.
    disable('RTDS_DIRECT_BEFORE_SEND_SAFETY_STOP');
    return {allow:false,reason:/^[A-Z0-9_]+$/.test(error.message)?error.message:'DIRECT_BEFORE_SEND_FAILURE'};
   }

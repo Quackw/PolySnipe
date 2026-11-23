@@ -16,8 +16,16 @@ export type TelegramSender = (chatId: number, text: string) => Promise<void>;
 
 export function createTelegramSender(options: TelegramSenderOptions): TelegramSender {
   return async (chatId: number, text: string): Promise<void> => {
+    let acknowledged = false;
     for (const chunk of splitForTelegram(text, 3900)) {
-      await sendMessage(options.token, chatId, chunk, options.timeoutMs);
+      try {
+        await sendMessage(options.token, chatId, chunk, options.timeoutMs);
+        acknowledged = true;
+      } catch (error) {
+        // A retryable rejection of this chunk cannot undo a previous acknowledgement.
+        if (acknowledged) throw new Error("Telegram partial delivery is unconfirmed");
+        throw error;
+      }
     }
     options.log(`[telegram] sent chat=${chatId} chars=${text.length}`);
   };
