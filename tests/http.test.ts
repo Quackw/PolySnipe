@@ -1,16 +1,29 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getText, calculateHttpRetryDelayMs, parseRetryAfterMs } from "../src/apis/http.js";
 
-afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
 
 it("reacquires for every attempt and releases before retry sleep", async () => {
   vi.useFakeTimers();
   const release = vi.fn();
   const acquire = vi.fn(async () => release);
   const pause = vi.fn();
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("limited", {status:429}))
-    .mockResolvedValueOnce(new Response("ok")));
-  const request = getText("https://example.invalid", {timeoutMs:5000,retries:1,beforeAttempt:acquire,onRateLimit:pause});
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce(new Response("limited", { status: 429 }))
+      .mockResolvedValueOnce(new Response("ok"))
+  );
+  const request = getText("https://example.invalid", {
+    timeoutMs: 5000,
+    retries: 1,
+    beforeAttempt: acquire,
+    onRateLimit: pause
+  });
   await vi.advanceTimersByTimeAsync(1);
   expect(release).toHaveBeenCalledTimes(1);
   expect(pause).toHaveBeenCalledTimes(1);
@@ -21,10 +34,20 @@ it("reacquires for every attempt and releases before retry sleep", async () => {
 });
 
 it("pauses the shared queue even when no retries remain", async () => {
-  const pause = vi.fn(), release = vi.fn();
-  vi.stubGlobal("fetch", vi.fn(async () => new Response("limited", {status:429, headers:{"retry-after":"10"}})));
-  await expect(getText("https://example.invalid", {timeoutMs:1000,retries:0,
-    beforeAttempt:async () => release,onRateLimit:pause})).rejects.toThrow("429");
+  const pause = vi.fn(),
+    release = vi.fn();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => new Response("limited", { status: 429, headers: { "retry-after": "10" } }))
+  );
+  await expect(
+    getText("https://example.invalid", {
+      timeoutMs: 1000,
+      retries: 0,
+      beforeAttempt: async () => release,
+      onRateLimit: pause
+    })
+  ).rejects.toThrow("429");
   expect(pause.mock.calls[0]?.[0]).toBeGreaterThanOrEqual(10000);
   expect(release).toHaveBeenCalledTimes(1);
 });

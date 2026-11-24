@@ -129,15 +129,22 @@ describe("repository admin reports", () => {
     db.close();
 
     const repo = new AppRepository(openDb(dbPath));
-    const rawDb = (repo as unknown as { db: { prepare: (sql: string) => { all: () => Array<{ name: string }> } } }).db;
-    const columns = rawDb.prepare(`PRAGMA table_info(alert_delay_samples)`).all().map((row) => row.name);
+    const rawDb = (
+      repo as unknown as { db: { prepare: (sql: string) => { all: () => Array<{ name: string }> } } }
+    ).db;
+    const columns = rawDb
+      .prepare(`PRAGMA table_info(alert_delay_samples)`)
+      .all()
+      .map((row) => row.name);
 
-    expect(columns).toEqual(expect.arrayContaining([
-      "poll_started_at_ms",
-      "fetch_completed_at_ms",
-      "send_completed_at_ms",
-      "delay_reason_code"
-    ]));
+    expect(columns).toEqual(
+      expect.arrayContaining([
+        "poll_started_at_ms",
+        "fetch_completed_at_ms",
+        "send_completed_at_ms",
+        "delay_reason_code"
+      ])
+    );
 
     repo.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -150,15 +157,35 @@ describe("repository admin reports", () => {
     repo.upsertSubscriber(2, 300, "private");
     repo.upsertSubscriber(3, 400, "private");
     const trackedSubscriber = repo.upsertSubscriber(4, 500, "private");
-    repo.upsertTrackedAccount({ proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", nextPollAtMs: 0 });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+      nextPollAtMs: 0
+    });
     repo.createSubscription(trackedSubscriber, 500, "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", 4, 1000);
 
-    const db = (repo as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => unknown } } }).db;
-    db.prepare(`UPDATE subscribers SET created_at = ? WHERE telegram_chat_id = ?`).run("2026-03-26T10:00:00.000Z", 100);
-    db.prepare(`UPDATE subscribers SET created_at = ? WHERE telegram_chat_id = ?`).run("2026-03-26T11:00:00.000Z", 200);
-    db.prepare(`UPDATE subscribers SET created_at = ? WHERE telegram_chat_id = ?`).run("2026-03-26T12:00:00.000Z", 300);
-    db.prepare(`UPDATE subscribers SET created_at = ? WHERE telegram_chat_id = ?`).run("2026-03-26T13:00:00.000Z", 400);
-    db.prepare(`UPDATE subscribers SET created_at = ? WHERE telegram_chat_id = ?`).run("2026-03-26T14:00:00.000Z", 500);
+    const db = (
+      repo as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => unknown } } }
+    ).db;
+    db.prepare(`UPDATE subscribers SET created_at = ? WHERE telegram_chat_id = ?`).run(
+      "2026-03-26T10:00:00.000Z",
+      100
+    );
+    db.prepare(`UPDATE subscribers SET created_at = ? WHERE telegram_chat_id = ?`).run(
+      "2026-03-26T11:00:00.000Z",
+      200
+    );
+    db.prepare(`UPDATE subscribers SET created_at = ? WHERE telegram_chat_id = ?`).run(
+      "2026-03-26T12:00:00.000Z",
+      300
+    );
+    db.prepare(`UPDATE subscribers SET created_at = ? WHERE telegram_chat_id = ?`).run(
+      "2026-03-26T13:00:00.000Z",
+      400
+    );
+    db.prepare(`UPDATE subscribers SET created_at = ? WHERE telegram_chat_id = ?`).run(
+      "2026-03-26T14:00:00.000Z",
+      500
+    );
 
     expect(repo.getAdminUsersReport()).toEqual({
       totalUsers: 1,
@@ -172,29 +199,34 @@ describe("repository admin reports", () => {
     const subscriberA = repo.upsertSubscriber(1, 100, "private");
     const subscriberB = repo.upsertSubscriber(2, 200, "private");
     repo.upsertSubscriber(3, 300, "private");
-    repo.upsertTrackedAccount({ proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", nextPollAtMs: 0 });
-    repo.upsertTrackedAccount({ proxyAddress: "0x1111111111111111111111111111111111111111", nextPollAtMs: 0 });
-    repo.upsertTrackedAccount({ proxyAddress: "0x2222222222222222222222222222222222222222", nextPollAtMs: 0 });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+      nextPollAtMs: 0
+    });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x1111111111111111111111111111111111111111",
+      nextPollAtMs: 0
+    });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x2222222222222222222222222222222222222222",
+      nextPollAtMs: 0
+    });
     repo.createSubscription(subscriberA, 100, "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", 1, 1000);
     repo.createSubscription(subscriberA, 100, "0x1111111111111111111111111111111111111111", 1, 1000);
     repo.createSubscription(subscriberB, 200, "0x2222222222222222222222222222222222222222", 2, 1000);
 
-    const db = (repo as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => unknown } } }).db;
-    db.prepare(`UPDATE subscriptions SET created_at = ? WHERE telegram_chat_id = ? AND proxy_address = ?`).run(
-      "2026-03-26T10:00:00.000Z",
-      100,
-      "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697"
-    );
-    db.prepare(`UPDATE subscriptions SET created_at = ? WHERE telegram_chat_id = ? AND proxy_address = ?`).run(
-      "2026-03-26T11:00:00.000Z",
-      100,
-      "0x1111111111111111111111111111111111111111"
-    );
-    db.prepare(`UPDATE subscriptions SET created_at = ? WHERE telegram_chat_id = ? AND proxy_address = ?`).run(
-      "2026-03-26T12:00:00.000Z",
-      200,
-      "0x2222222222222222222222222222222222222222"
-    );
+    const db = (
+      repo as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => unknown } } }
+    ).db;
+    db.prepare(
+      `UPDATE subscriptions SET created_at = ? WHERE telegram_chat_id = ? AND proxy_address = ?`
+    ).run("2026-03-26T10:00:00.000Z", 100, "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697");
+    db.prepare(
+      `UPDATE subscriptions SET created_at = ? WHERE telegram_chat_id = ? AND proxy_address = ?`
+    ).run("2026-03-26T11:00:00.000Z", 100, "0x1111111111111111111111111111111111111111");
+    db.prepare(
+      `UPDATE subscriptions SET created_at = ? WHERE telegram_chat_id = ? AND proxy_address = ?`
+    ).run("2026-03-26T12:00:00.000Z", 200, "0x2222222222222222222222222222222222222222");
     repo.insertAlertDelaySamples([
       {
         telegramChatId: 100,
@@ -217,9 +249,18 @@ describe("repository admin reports", () => {
     const { repo } = setupRepo();
     const subscriberA = repo.upsertSubscriber(1, 100, "private");
     const subscriberB = repo.upsertSubscriber(2, 200, "private");
-    repo.upsertTrackedAccount({ proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", nextPollAtMs: 0 });
-    repo.upsertTrackedAccount({ proxyAddress: "0x1111111111111111111111111111111111111111", nextPollAtMs: 0 });
-    repo.upsertTrackedAccount({ proxyAddress: "0x2222222222222222222222222222222222222222", nextPollAtMs: 0 });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+      nextPollAtMs: 0
+    });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x1111111111111111111111111111111111111111",
+      nextPollAtMs: 0
+    });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x2222222222222222222222222222222222222222",
+      nextPollAtMs: 0
+    });
     repo.createSubscription(subscriberA, 100, "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", 1, 1000);
     repo.createSubscription(subscriberB, 200, "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", 2, 1000);
     repo.createSubscription(subscriberA, 100, "0x1111111111111111111111111111111111111111", 1, 1000);
@@ -414,7 +455,16 @@ describe("repository admin reports", () => {
       throttleWaitMs: 0
     });
 
-    const db = (repo as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => unknown; get: (...args: unknown[]) => { count: number } } } }).db;
+    const db = (
+      repo as unknown as {
+        db: {
+          prepare: (sql: string) => {
+            run: (...args: unknown[]) => unknown;
+            get: (...args: unknown[]) => { count: number };
+          };
+        };
+      }
+    ).db;
     db.prepare(`UPDATE poll_runs SET created_at = ?`).run("2026-03-20T12:00:00.000Z");
     repo.insertPollRun({
       kind: "heartbeat",
@@ -451,7 +501,15 @@ describe("repository admin reports", () => {
     repo.insertAlertDelaySamples(rows);
     expect(repo.cleanupAlertDelaySamplesOverflow()).toBe(5);
 
-    const db = (repo as unknown as { db: { prepare: (sql: string) => { get: (...args: unknown[]) => { count: number; oldestSendStartedAtMs: number } } } }).db;
+    const db = (
+      repo as unknown as {
+        db: {
+          prepare: (sql: string) => {
+            get: (...args: unknown[]) => { count: number; oldestSendStartedAtMs: number };
+          };
+        };
+      }
+    ).db;
     const row = db
       .prepare(
         `

@@ -30,7 +30,11 @@ export function parseRetryAfterMs(value: string | null, nowMs = Date.now()): num
   return Number.isFinite(dateMs) ? Math.max(0, dateMs - nowMs) : undefined;
 }
 
-export function calculateHttpRetryDelayMs(error: unknown, attempt: number, randomValue = Math.random()): number {
+export function calculateHttpRetryDelayMs(
+  error: unknown,
+  attempt: number,
+  randomValue = Math.random()
+): number {
   const httpError = error as HttpError;
   if (httpError?.statusCode === 429) {
     const exponentialMs = Math.min(30_000, 1000 * 2 ** Math.max(0, attempt - 1));

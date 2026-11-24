@@ -32,10 +32,7 @@ describe("filterAllowedActivities", () => {
 describe("updateWatermarkState", () => {
   it("bootstraps on first run", () => {
     const rows = [activity(20, "a"), activity(19, "b")];
-    const result = updateWatermarkState(
-      { initialized: false, lastSeenTimestamp: 0, lastSeenKeys: [] },
-      rows
-    );
+    const result = updateWatermarkState({ initialized: false, lastSeenTimestamp: 0, lastSeenKeys: [] }, rows);
 
     expect(result.bootstrap).toBe(true);
     expect(result.newActivities).toEqual([]);

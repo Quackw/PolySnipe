@@ -1,18 +1,22 @@
-import {isRetryableSqliteLock} from './sqlite-lock.mjs';
+import { isRetryableSqliteLock } from './sqlite-lock.mjs';
 
 // The single sender resolves only its own claim, even if it loses ownership.
-export function createDeliveryClaimGuard(db, {onClaimLost, now=Date.now}) {
-  const release = db.prepare("UPDATE deliveries SET state=?,claim_token=NULL,next_at_ms=?," +
-    "last_error=?,attempts=?,ambiguous_retries=?,send_started_at_ms=? " +
-    "WHERE event_key=? AND chat_id=? AND state='SENDING' AND claim_token=?");
-  const unknown = db.prepare("UPDATE deliveries SET state='DELIVERY_UNKNOWN',claim_token=NULL," +
-    "next_at_ms=0,possible_duplicate=1,last_error='SEND_WORKER_EXCEPTION' " +
-    "WHERE event_key=? AND chat_id=? AND state='SENDING' AND claim_token=?");
+export function createDeliveryClaimGuard(db, { onClaimLost, now = Date.now }) {
+  const release = db.prepare(
+    'UPDATE deliveries SET state=?,claim_token=NULL,next_at_ms=?,' +
+      'last_error=?,attempts=?,ambiguous_retries=?,send_started_at_ms=? ' +
+      "WHERE event_key=? AND chat_id=? AND state='SENDING' AND claim_token=?"
+  );
+  const unknown = db.prepare(
+    "UPDATE deliveries SET state='DELIVERY_UNKNOWN',claim_token=NULL," +
+      "next_at_ms=0,possible_duplicate=1,last_error='SEND_WORKER_EXCEPTION' " +
+      "WHERE event_key=? AND chat_id=? AND state='SENDING' AND claim_token=?"
+  );
   let unsettled;
 
   function flush() {
     if (!unsettled) return true;
-    const {row, started, reason} = unsettled;
+    const { row, started, reason } = unsettled;
     const key = [row.event_key, row.chat_id, row.claimToken];
     let result;
     try {
@@ -20,10 +24,15 @@ export function createDeliveryClaimGuard(db, {onClaimLost, now=Date.now}) {
         result = unknown.run(...key);
       } else {
         const cancelled = reason === 'SUBSCRIPTION_INACTIVE';
-        result = release.run(cancelled ? 'CANCELLED_SUBSCRIPTION' : 'PENDING',
+        result = release.run(
+          cancelled ? 'CANCELLED_SUBSCRIPTION' : 'PENDING',
           cancelled ? 0 : Math.max(row.next_at_ms, now() + 250),
-          cancelled ? 'subscription_removed' : reason, row.attempts,
-          row.ambiguous_retries, row.send_started_at_ms, ...key);
+          cancelled ? 'subscription_removed' : reason,
+          row.attempts,
+          row.ambiguous_retries,
+          row.send_started_at_ms,
+          ...key
+        );
       }
     } catch (error) {
       // Keep this SQLite-only write ahead of any future network work.
@@ -44,24 +53,29 @@ export function createDeliveryClaimGuard(db, {onClaimLost, now=Date.now}) {
       if (reason) return;
       started = true;
       const result = await request(row);
-      onResult(result, () => { settled = true; });
+      onResult(result, () => {
+        settled = true;
+      });
     } finally {
       if (!settled) {
-        unsettled = {row, started, reason: reason ?? 'SEND_WORKER_EXCEPTION'};
+        unsettled = { row, started, reason: reason ?? 'SEND_WORKER_EXCEPTION' };
         flush();
       }
     }
   }
 
-  return {run, flush};
+  return { run, flush };
 }
 
 // The trace receives exactly the rows cancelled under the writer lock.
 export function createSubscriptionCancellation(db) {
   const pending = "wallet=? AND chat_id=? AND state IN ('PENDING','FAILED_RETRYABLE','DELIVERY_UNKNOWN')";
-  const read = db.prepare("SELECT event_key,chat_id,attempts FROM deliveries WHERE " + pending);
-  const cancel = db.prepare("UPDATE deliveries SET state='CANCELLED_SUBSCRIPTION',next_at_ms=0," +
-    "last_error='subscription_removed' WHERE " + pending);
+  const read = db.prepare('SELECT event_key,chat_id,attempts FROM deliveries WHERE ' + pending);
+  const cancel = db.prepare(
+    "UPDATE deliveries SET state='CANCELLED_SUBSCRIPTION',next_at_ms=0," +
+      "last_error='subscription_removed' WHERE " +
+      pending
+  );
   return db.transaction((wallet, chatId) => {
     const rows = read.all(wallet, chatId);
     cancel.run(wallet, chatId);

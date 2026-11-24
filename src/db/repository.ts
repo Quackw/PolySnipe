@@ -23,7 +23,14 @@ export const MAX_ALERT_ATTEMPTS = 10;
 const ATTEMPTS_EXHAUSTED = "Delivery attempt limit reached";
 
 export type OutboxInsert = { chatId: number; text: string; contextJson: string };
-export type OutboxRow = { id: number; chat_id: number; proxy_address: string; text: string; context_json: string; attempts: number };
+export type OutboxRow = {
+  id: number;
+  chat_id: number;
+  proxy_address: string;
+  text: string;
+  context_json: string;
+  attempts: number;
+};
 
 type ChatSessionRow = {
   telegram_chat_id: number;
@@ -622,9 +629,10 @@ export class AppRepository {
         const ageAtPollStartMs = clampDurationMs(activityTimestampMs, pollStartedAtMs);
         if (ageAtPollStartMs < thresholdMs) {
           const freshLocalDelayMs = clampDurationMs(pollStartedAtMs, sendCompletedAtMs);
-          freshLocalMaxDelayMs = typeof freshLocalMaxDelayMs === "number"
-            ? Math.max(freshLocalMaxDelayMs, freshLocalDelayMs)
-            : freshLocalDelayMs;
+          freshLocalMaxDelayMs =
+            typeof freshLocalMaxDelayMs === "number"
+              ? Math.max(freshLocalMaxDelayMs, freshLocalDelayMs)
+              : freshLocalDelayMs;
         }
       }
 
@@ -703,7 +711,10 @@ export class AppRepository {
     return result.changes;
   }
 
-  public removeSubscription(chatId: number, proxyAddress: string): { removedSubscriptions: number; removedTrackedAccounts: number } {
+  public removeSubscription(
+    chatId: number,
+    proxyAddress: string
+  ): { removedSubscriptions: number; removedTrackedAccounts: number } {
     const tx = this.db.transaction((safeChatId: number, safeProxyAddress: string) => {
       this.cancelPendingSubscriptions(safeChatId, safeProxyAddress);
       const removedSubscriptions = this.db
@@ -715,14 +726,18 @@ export class AppRepository {
         )
         .run(safeChatId, safeProxyAddress).changes;
 
-      const removedTrackedAccounts = removedSubscriptions > 0 ? this.cleanupTrackedAccountIfOrphaned(safeProxyAddress) : 0;
+      const removedTrackedAccounts =
+        removedSubscriptions > 0 ? this.cleanupTrackedAccountIfOrphaned(safeProxyAddress) : 0;
       return { removedSubscriptions, removedTrackedAccounts };
     });
 
     return tx.immediate(chatId, proxyAddress.toLowerCase());
   }
 
-  public removeAllSubscriptions(chatId: number): { removedSubscriptions: number; removedTrackedAccounts: number } {
+  public removeAllSubscriptions(chatId: number): {
+    removedSubscriptions: number;
+    removedTrackedAccounts: number;
+  } {
     const tx = this.db.transaction((safeChatId: number) => {
       const proxyRows = this.db
         .prepare(
@@ -756,12 +771,14 @@ export class AppRepository {
   }
 
   private cancelPendingSubscriptions(chatId: number, proxyAddress: string | null = null): void {
-    this.db.prepare(`UPDATE alert_outbox
+    this.db
+      .prepare(`UPDATE alert_outbox
       SET status='CANCELLED', next_attempt_ms=0, last_error='Subscription removed',
         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE status='PENDING' AND subscription_id IN (
         SELECT id FROM subscriptions WHERE telegram_chat_id=? AND (? IS NULL OR proxy_address=?)
-      )`).run(chatId, proxyAddress, proxyAddress);
+      )`)
+      .run(chatId, proxyAddress, proxyAddress);
   }
 
   public cleanupTrackedAccountIfOrphaned(proxyAddress: string): number {
@@ -805,7 +822,9 @@ export class AppRepository {
   }
 
   public countInflightTrackedAccounts(): number {
-    const row = this.db.prepare(`SELECT COUNT(*) AS count FROM tracked_accounts WHERE inflight = 1`).get() as { count: number };
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS count FROM tracked_accounts WHERE inflight = 1`)
+      .get() as { count: number };
     return row.count;
   }
 
@@ -877,10 +896,11 @@ export class AppRepository {
     nextPollAtMs: number;
     alerts?: OutboxInsert[];
   }): void {
-    this.db.transaction(() => {
-      this.db
-        .prepare(
-          `
+    this.db
+      .transaction(() => {
+        this.db
+          .prepare(
+            `
             UPDATE tracked_accounts
             SET
               last_seen_timestamp = ?,
@@ -893,25 +913,31 @@ export class AppRepository {
               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE proxy_address = ?
           `
-        )
-        .run(
-          payload.lastSeenTimestamp,
-          JSON.stringify(payload.lastSeenKeys),
-          payload.lastPolledAtMs,
-          payload.nextPollAtMs,
-          payload.proxyAddress.toLowerCase()
-        );
-      for (const alert of payload.alerts ?? []) {
-        this.db.prepare(`INSERT INTO alert_outbox(subscription_id,proxy_address,chat_id,text,context_json)
+          )
+          .run(
+            payload.lastSeenTimestamp,
+            JSON.stringify(payload.lastSeenKeys),
+            payload.lastPolledAtMs,
+            payload.nextPollAtMs,
+            payload.proxyAddress.toLowerCase()
+          );
+        for (const alert of payload.alerts ?? []) {
+          this.db
+            .prepare(`INSERT INTO alert_outbox(subscription_id,proxy_address,chat_id,text,context_json)
           SELECT id,proxy_address,telegram_chat_id,?,? FROM subscriptions
-          WHERE proxy_address=? AND telegram_chat_id=?`).run(
-            alert.text, alert.contextJson, payload.proxyAddress.toLowerCase(), alert.chatId);
-      }
-    }).immediate();
+          WHERE proxy_address=? AND telegram_chat_id=?`)
+            .run(alert.text, alert.contextJson, payload.proxyAddress.toLowerCase(), alert.chatId);
+        }
+      })
+      .immediate();
   }
 
   public recoverOutbox(): number {
-    return this.db.prepare("UPDATE alert_outbox SET status='UNKNOWN',last_error='Process stopped during send' WHERE status='SENDING'").run().changes;
+    return this.db
+      .prepare(
+        "UPDATE alert_outbox SET status='UNKNOWN',last_error='Process stopped during send' WHERE status='SENDING'"
+      )
+      .run().changes;
   }
 
   public listPendingAlerts(nowMs: number, limit = 100): OutboxRow[] {
@@ -919,25 +945,48 @@ export class AppRepository {
   }
 
   public claimAlert(id: number): boolean {
-    return this.db.prepare(`UPDATE alert_outbox SET status='SENDING',attempts=attempts+1
+    return (
+      this.db
+        .prepare(`UPDATE alert_outbox SET status='SENDING',attempts=attempts+1
       WHERE id=? AND status='PENDING' AND attempts<? AND EXISTS
-      (SELECT 1 FROM subscriptions WHERE id=alert_outbox.subscription_id)`).run(id, MAX_ALERT_ATTEMPTS).changes === 1;
+      (SELECT 1 FROM subscriptions WHERE id=alert_outbox.subscription_id)`)
+        .run(id, MAX_ALERT_ATTEMPTS).changes === 1
+    );
   }
 
-  public finishAlert(id: number, status: 'DELIVERED'|'UNKNOWN'|'REJECTED'|'PENDING', error: string|null = null, nextAttemptMs = 0): boolean {
-    const result = this.db.prepare(`UPDATE alert_outbox SET
+  public finishAlert(
+    id: number,
+    status: "DELIVERED" | "UNKNOWN" | "REJECTED" | "PENDING",
+    error: string | null = null,
+    nextAttemptMs = 0
+  ): boolean {
+    const result = this.db
+      .prepare(`UPDATE alert_outbox SET
       status=CASE WHEN @status='PENDING' AND attempts>=@maxAttempts THEN 'REJECTED' ELSE @status END,
       last_error=CASE WHEN @status='PENDING' AND attempts>=@maxAttempts THEN @exhausted ELSE @error END,
       next_attempt_ms=CASE WHEN @status='PENDING' AND attempts<@maxAttempts THEN @nextAttemptMs ELSE 0 END,
       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE id=@id AND status='SENDING'`).run({
-        id, status, error, nextAttemptMs, maxAttempts: MAX_ALERT_ATTEMPTS, exhausted: ATTEMPTS_EXHAUSTED
+      WHERE id=@id AND status='SENDING'`)
+      .run({
+        id,
+        status,
+        error,
+        nextAttemptMs,
+        maxAttempts: MAX_ALERT_ATTEMPTS,
+        exhausted: ATTEMPTS_EXHAUSTED
       });
     return result.changes === 1;
   }
 
   public outboxCounts(): Record<string, number> {
-    return Object.fromEntries((this.db.prepare('SELECT status,count(*) AS n FROM alert_outbox GROUP BY status').all() as Array<{status:string;n:number}>).map(row=>[row.status,row.n]));
+    return Object.fromEntries(
+      (
+        this.db.prepare("SELECT status,count(*) AS n FROM alert_outbox GROUP BY status").all() as Array<{
+          status: string;
+          n: number;
+        }>
+      ).map((row) => [row.status, row.n])
+    );
   }
 
   public markPollFailure(proxyAddress: string, nextPollAtMs: number, consecutiveErrors: number): void {

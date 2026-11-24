@@ -1,6 +1,5 @@
 // Empty successful polls are healthy: lack of user messages is not a failure.
-export function pollingHealth(onStale: () => void, now = Date.now,
-  staleMs = 180_000, checkMs = 10_000) {
+export function pollingHealth(onStale: () => void, now = Date.now, staleMs = 180_000, checkMs = 10_000) {
   let lastSuccess = now();
   let tripped = false;
   const timer = setInterval(() => {
@@ -11,7 +10,9 @@ export function pollingHealth(onStale: () => void, now = Date.now,
   }, checkMs);
   timer.unref();
   return {
-    success: () => { lastSuccess = now(); },
+    success: () => {
+      lastSuccess = now();
+    },
     stop: () => clearInterval(timer)
   };
 }

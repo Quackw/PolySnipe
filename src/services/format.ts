@@ -165,7 +165,11 @@ export function renderInvalidSubscribeInput(): string {
   ].join("\n");
 }
 
-export function renderUnsubscribePrompt(subscriptions: readonly ChatSubscriptionView[], page: number, totalPages: number): string {
+export function renderUnsubscribePrompt(
+  subscriptions: readonly ChatSubscriptionView[],
+  page: number,
+  totalPages: number
+): string {
   return [
     "<b>Select account(s) to unsubscribe</b>",
     `Subscriptions: <b>${subscriptions.length}</b>`,
@@ -232,10 +236,7 @@ export function renderAdminStats(stats: AdminSubscriberStats): string {
 }
 
 export function renderAdminMenuPrompt(): string {
-  return [
-    "<b>Admin reports</b>",
-    "Choose a report:"
-  ].join("\n");
+  return ["<b>Admin reports</b>", "Choose a report:"].join("\n");
 }
 
 export function renderAdminUsersReport(report: AdminUsersReport): string {
@@ -258,10 +259,7 @@ export function renderAdminSubscriptionsReport(report: AdminSubscriptionsReport)
 
 export function renderAdminProfilesReport(stats: readonly AdminProfileStat[]): string {
   if (stats.length === 0) {
-    return [
-      "<b>Profiles</b>",
-      "No subscriptions yet."
-    ].join("\n");
+    return ["<b>Profiles</b>", "No subscriptions yet."].join("\n");
   }
 
   const lines = ["<b>Profiles</b>"];
@@ -275,10 +273,7 @@ export function renderAdminProfilesReport(stats: readonly AdminProfileStat[]): s
 
 export function renderAdminPerformanceReport(report: AdminPerformanceReport): string {
   if (report.sampleCount === 0) {
-    return [
-      "<b>Performance</b>",
-      "No performance data for the last 24 hours."
-    ].join("\n");
+    return ["<b>Performance</b>", "No performance data for the last 24 hours."].join("\n");
   }
 
   const lines = [

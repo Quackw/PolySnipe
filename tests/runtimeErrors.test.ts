@@ -18,7 +18,9 @@ describe("notifyFatalError", () => {
     });
     const log = vi.fn();
 
-    await expect(notifyFatalError({ notifyError }, "startup", new Error("boom"), log)).resolves.toBeUndefined();
+    await expect(
+      notifyFatalError({ notifyError }, "startup", new Error("boom"), log)
+    ).resolves.toBeUndefined();
     expect(log).toHaveBeenCalledWith(expect.stringContaining("[notify:fatal]"));
   });
 });

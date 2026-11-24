@@ -1,4 +1,93 @@
-import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {EventEmitter} from 'node:events';import {PassThrough} from 'node:stream';import {prepareBSSH} from './b-ssh-client.mjs';
-function fixture(){const dir=fs.mkdtempSync(path.join(os.tmpdir(),'b-ssh-config-'));fs.chmodSync(dir,0o700);const identityFile=path.join(dir,'identity'),knownHostsFile=path.join(dir,'known_hosts');fs.writeFileSync(identityFile,'fixture',{mode:0o600});fs.writeFileSync(knownHostsFile,'fixture',{mode:0o600});const input={host:'fast.internal',user:'root',identityFile,knownHostsFile,runId:'offline-bridge-test',scopeFingerprint:'a'.repeat(64),key:Buffer.alloc(32,1),wallets:['0x'+'1'.repeat(40)]};return {dir,input,close(){fs.rmSync(dir,{recursive:true,force:true});}};}
-test('construction is inert; start uses one pinned fixed SSH command and no shell',()=>{const f=fixture();try{let called=0,record,child;f.input.spawn=(...args)=>{called++;record=args;child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.kill=()=>true;return child;};const prepared=prepareBSSH(f.input);assert.equal(called,0);const relay=prepared.start();assert.equal(called,1);assert.equal(record[0],'/usr/bin/ssh');assert.equal(record[2].shell,false);assert.equal(record[2].env.HOME,'/nonexistent');assert.ok(record[1].includes('-4'));for(const value of ['BatchMode=yes','IdentitiesOnly=yes','StrictHostKeyChecking=yes','ClearAllForwardings=yes','ControlMaster=no'])assert.ok(record[1].includes(value));assert.deepEqual(record[1].slice(-2),['--','fast.internal']);assert.throws(()=>prepared.start(),/STILL_ACTIVE/);relay.close();assert.throws(()=>prepared.start(),/STILL_ACTIVE/);child.emit('exit',0);const next=prepared.start();assert.equal(called,2);prepared.close();assert.equal(next.status().state,'CLOSED');assert.throws(()=>prepared.start(),/SSH_CLOSED/);}finally{f.close();}});
-test('unsafe paths and target names fail before subprocess creation',()=>{const f=fixture();try{let calls=0;f.input.spawn=()=>{calls++;};assert.throws(()=>prepareBSSH({...f.input,host:'-evil'}));fs.chmodSync(f.input.identityFile,0o644);assert.throws(()=>prepareBSSH(f.input),/PRIVATE_FILE/);assert.equal(calls,0);}finally{f.close();}});
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { prepareBSSH } from './b-ssh-client.mjs';
+function fixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'b-ssh-config-'));
+  fs.chmodSync(dir, 0o700);
+  const identityFile = path.join(dir, 'identity'),
+    knownHostsFile = path.join(dir, 'known_hosts');
+  fs.writeFileSync(identityFile, 'fixture', { mode: 0o600 });
+  fs.writeFileSync(knownHostsFile, 'fixture', { mode: 0o600 });
+  const input = {
+    host: 'fast.internal',
+    user: 'root',
+    identityFile,
+    knownHostsFile,
+    runId: 'offline-bridge-test',
+    scopeFingerprint: 'a'.repeat(64),
+    key: Buffer.alloc(32, 1),
+    wallets: ['0x' + '1'.repeat(40)]
+  };
+  return {
+    dir,
+    input,
+    close() {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+}
+test('construction is inert; start uses one pinned fixed SSH command and no shell', () => {
+  const f = fixture();
+  try {
+    let called = 0,
+      record,
+      child;
+    f.input.spawn = (...args) => {
+      called++;
+      record = args;
+      child = new EventEmitter();
+      child.stdin = new PassThrough();
+      child.stdout = new PassThrough();
+      child.kill = () => true;
+      return child;
+    };
+    const prepared = prepareBSSH(f.input);
+    assert.equal(called, 0);
+    const relay = prepared.start();
+    assert.equal(called, 1);
+    assert.equal(record[0], '/usr/bin/ssh');
+    assert.equal(record[2].shell, false);
+    assert.equal(record[2].env.HOME, '/nonexistent');
+    assert.ok(record[1].includes('-4'));
+    for (const value of [
+      'BatchMode=yes',
+      'IdentitiesOnly=yes',
+      'StrictHostKeyChecking=yes',
+      'ClearAllForwardings=yes',
+      'ControlMaster=no'
+    ])
+      assert.ok(record[1].includes(value));
+    assert.deepEqual(record[1].slice(-2), ['--', 'fast.internal']);
+    assert.throws(() => prepared.start(), /STILL_ACTIVE/);
+    relay.close();
+    assert.throws(() => prepared.start(), /STILL_ACTIVE/);
+    child.emit('exit', 0);
+    const next = prepared.start();
+    assert.equal(called, 2);
+    prepared.close();
+    assert.equal(next.status().state, 'CLOSED');
+    assert.throws(() => prepared.start(), /SSH_CLOSED/);
+  } finally {
+    f.close();
+  }
+});
+test('unsafe paths and target names fail before subprocess creation', () => {
+  const f = fixture();
+  try {
+    let calls = 0;
+    f.input.spawn = () => {
+      calls++;
+    };
+    assert.throws(() => prepareBSSH({ ...f.input, host: '-evil' }));
+    fs.chmodSync(f.input.identityFile, 0o644);
+    assert.throws(() => prepareBSSH(f.input), /PRIVATE_FILE/);
+    assert.equal(calls, 0);
+  } finally {
+    f.close();
+  }
+});

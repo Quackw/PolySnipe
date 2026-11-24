@@ -6,7 +6,11 @@ import { openDb } from "../src/db/client.js";
 import { AppRepository } from "../src/db/repository.js";
 import type { AppConfig } from "../src/types.js";
 
-export function createTempRepo(prefix = "poly-snipe-test"): { repo: AppRepository; dbPath: string; cleanup: () => void } {
+export function createTempRepo(prefix = "poly-snipe-test"): {
+  repo: AppRepository;
+  dbPath: string;
+  cleanup: () => void;
+} {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
   const dbPath = path.join(tmpDir, "state.db");
   const db = openDb(dbPath);

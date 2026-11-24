@@ -17,7 +17,9 @@ async function notifyWithDeadline(notify: () => Promise<void>): Promise<void> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      new Promise<void>((resolve) => { timeout = setTimeout(resolve, FATAL_NOTIFY_TIMEOUT_MS); }),
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, FATAL_NOTIFY_TIMEOUT_MS);
+      }),
       Promise.resolve().then(notify)
     ]);
   } catch {
@@ -67,23 +69,25 @@ export async function main(config = loadConfig()): Promise<void> {
     if (shutdownPromise) return shutdownPromise;
     stopping = true;
     armShutdownDeadline();
-    shutdownPromise = Promise.resolve().then(async () => {
-      health.stop();
-      const results = await Promise.allSettled([
-        Promise.resolve().then(() => bot.isRunning() ? bot.stop() : undefined),
-        Promise.resolve().then(() => scheduler.stopAndDrain())
-      ]);
-      db.close();
-      if (results.some((result) => result.status === "rejected")) throw new Error("Drain failed");
-      clearTimeout(shutdownDeadline);
-      process.off("SIGINT", onSignal);
-      process.off("SIGTERM", onSignal);
-      process.off("uncaughtException", onUncaughtException);
-      process.off("unhandledRejection", onUnhandledRejection);
-    }).catch(() => {
-      console.error("[fatal] Shutdown failed");
-      process.exit(1);
-    });
+    shutdownPromise = Promise.resolve()
+      .then(async () => {
+        health.stop();
+        const results = await Promise.allSettled([
+          Promise.resolve().then(() => (bot.isRunning() ? bot.stop() : undefined)),
+          Promise.resolve().then(() => scheduler.stopAndDrain())
+        ]);
+        db.close();
+        if (results.some((result) => result.status === "rejected")) throw new Error("Drain failed");
+        clearTimeout(shutdownDeadline);
+        process.off("SIGINT", onSignal);
+        process.off("SIGTERM", onSignal);
+        process.off("uncaughtException", onUncaughtException);
+        process.off("unhandledRejection", onUnhandledRejection);
+      })
+      .catch(() => {
+        console.error("[fatal] Shutdown failed");
+        process.exit(1);
+      });
     return shutdownPromise;
   };
 
@@ -152,8 +156,9 @@ function start(): void {
       log: (line) => console.log(line)
     });
     const notifier = createAdminNotifier(config, sender, (line) => console.log(line));
-    void notifyWithDeadline(() => notifyFatalError(notifier, "startup", error, (line) => console.log(line)))
-      .finally(() => process.exit(1));
+    void notifyWithDeadline(() =>
+      notifyFatalError(notifier, "startup", error, (line) => console.log(line))
+    ).finally(() => process.exit(1));
   });
 }
 

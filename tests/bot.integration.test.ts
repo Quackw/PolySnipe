@@ -20,7 +20,9 @@ function messageUpdate(
   text: string,
   chatType: "private" | "group" = "private"
 ): Update {
-  const entities = text.startsWith("/") ? [{ offset: 0, length: text.length, type: "bot_command" as const }] : undefined;
+  const entities = text.startsWith("/")
+    ? [{ offset: 0, length: text.length, type: "bot_command" as const }]
+    : undefined;
   return {
     update_id: updateId,
     message: {
@@ -40,7 +42,9 @@ function keyboardButtons(call: { payload: Record<string, unknown> }): string[][]
 }
 
 function inlineButtons(call: { payload: Record<string, unknown> }): string[][] {
-  const replyMarkup = call.payload.reply_markup as { inline_keyboard?: Array<Array<{ text?: string }>> } | undefined;
+  const replyMarkup = call.payload.reply_markup as
+    | { inline_keyboard?: Array<Array<{ text?: string }>> }
+    | undefined;
   return (replyMarkup?.inline_keyboard ?? []).map((row) => row.map((button) => String(button.text ?? "")));
 }
 
@@ -97,7 +101,11 @@ afterEach(() => {
 describe("bot flow", () => {
   it("shows only Subscribe and Unsubscribe for non-admin private chats", async () => {
     const { repo, dbPath } = setupRepo();
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [99] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [99] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -117,7 +125,11 @@ describe("bot flow", () => {
 
   it("shows Admin for admins in private chats", async () => {
     const { repo, dbPath } = setupRepo();
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [10, 20] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [10, 20] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -137,7 +149,11 @@ describe("bot flow", () => {
 
   it("keeps the two-button keyboard in group chats even for admins", async () => {
     const { repo, dbPath } = setupRepo();
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [10, 20] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [10, 20] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -226,7 +242,11 @@ describe("bot flow", () => {
 
   it("denies unauthorized /admin access", async () => {
     const { repo, dbPath } = setupRepo();
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [999, 555] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [999, 555] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -246,7 +266,11 @@ describe("bot flow", () => {
 
   it("denies unauthorized Admin button access", async () => {
     const { repo, dbPath } = setupRepo();
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [999, 555] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [999, 555] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -266,7 +290,11 @@ describe("bot flow", () => {
 
   it("opens the admin submenu for authorized /admin", async () => {
     const { repo, dbPath } = setupRepo();
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [10, 20] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [10, 20] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -291,7 +319,11 @@ describe("bot flow", () => {
 
   it("opens the same admin submenu when an authorized admin presses Admin", async () => {
     const { repo, dbPath } = setupRepo();
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [10, 20] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [10, 20] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -319,12 +351,22 @@ describe("bot flow", () => {
     const subscriberA = repo.upsertSubscriber(10, 123, "private");
     const subscriberB = repo.upsertSubscriber(20, 789, "private");
     repo.upsertSubscriber(30, 456, "private");
-    repo.upsertTrackedAccount({ proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", nextPollAtMs: 0 });
-    repo.upsertTrackedAccount({ proxyAddress: "0x1111111111111111111111111111111111111111", nextPollAtMs: 0 });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+      nextPollAtMs: 0
+    });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x1111111111111111111111111111111111111111",
+      nextPollAtMs: 0
+    });
     repo.createSubscription(subscriberA, 123, "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", 10, 1000);
     repo.createSubscription(subscriberB, 789, "0x1111111111111111111111111111111111111111", 20, 1000);
 
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [10, 20] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [10, 20] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -349,8 +391,14 @@ describe("bot flow", () => {
     const nowMs = Date.UTC(2026, 2, 27, 12, 0, 0);
     const subscriberA = repo.upsertSubscriber(10, 123, "private");
     const subscriberB = repo.upsertSubscriber(20, 456, "private");
-    repo.upsertTrackedAccount({ proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", nextPollAtMs: 0 });
-    repo.upsertTrackedAccount({ proxyAddress: "0x1111111111111111111111111111111111111111", nextPollAtMs: 0 });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+      nextPollAtMs: 0
+    });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x1111111111111111111111111111111111111111",
+      nextPollAtMs: 0
+    });
     repo.createSubscription(subscriberA, 123, "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", 10, 1000);
     repo.createSubscription(subscriberA, 123, "0x1111111111111111111111111111111111111111", 10, 1000);
     repo.createSubscription(subscriberB, 456, "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", 20, 1000);
@@ -364,7 +412,11 @@ describe("bot flow", () => {
       }
     ]);
 
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [10, 20] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [10, 20] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -379,7 +431,9 @@ describe("bot flow", () => {
 
     await bot.handleUpdate(callbackUpdate(1, 123, 10, "admin:subscriptions"));
 
-    const subscriptionsMessage = calls.find((call) => String(call.payload.text).includes("<b>Subscriptions</b>"));
+    const subscriptionsMessage = calls.find((call) =>
+      String(call.payload.text).includes("<b>Subscriptions</b>")
+    );
     expect(String(subscriptionsMessage?.payload.text ?? "")).toContain("Subscriptions: <b>3</b>");
     expect(String(subscriptionsMessage?.payload.text ?? "")).toContain("Avg per user: <b>1.5</b>");
     expect(String(subscriptionsMessage?.payload.text ?? "")).toContain("Last subscription created at:");
@@ -390,13 +444,23 @@ describe("bot flow", () => {
     const { repo, dbPath } = setupRepo();
     const subscriberA = repo.upsertSubscriber(10, 123, "private");
     const subscriberB = repo.upsertSubscriber(20, 456, "private");
-    repo.upsertTrackedAccount({ proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", nextPollAtMs: 0 });
-    repo.upsertTrackedAccount({ proxyAddress: "0x1111111111111111111111111111111111111111", nextPollAtMs: 0 });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+      nextPollAtMs: 0
+    });
+    repo.upsertTrackedAccount({
+      proxyAddress: "0x1111111111111111111111111111111111111111",
+      nextPollAtMs: 0
+    });
     repo.createSubscription(subscriberA, 123, "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", 10, 1000);
     repo.createSubscription(subscriberB, 456, "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", 20, 1000);
     repo.createSubscription(subscriberB, 456, "0x1111111111111111111111111111111111111111", 20, 1000);
 
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [10, 20] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [10, 20] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -412,8 +476,12 @@ describe("bot flow", () => {
     await bot.handleUpdate(callbackUpdate(1, 123, 10, "admin:profiles"));
 
     const profilesMessage = calls.find((call) => String(call.payload.text).includes("<b>Profiles</b>"));
-    expect(String(profilesMessage?.payload.text ?? "")).toContain("https://polymarket.com/0x03e8a544e97eeff5753bc1e90d46e5ef22af1697");
-    expect(String(profilesMessage?.payload.text ?? "")).toContain("https://polymarket.com/0x1111111111111111111111111111111111111111");
+    expect(String(profilesMessage?.payload.text ?? "")).toContain(
+      "https://polymarket.com/0x03e8a544e97eeff5753bc1e90d46e5ef22af1697"
+    );
+    expect(String(profilesMessage?.payload.text ?? "")).toContain(
+      "https://polymarket.com/0x1111111111111111111111111111111111111111"
+    );
     expect(String(profilesMessage?.payload.text ?? "")).toContain("<b>2</b>");
   });
 
@@ -444,7 +512,11 @@ describe("bot flow", () => {
       }
     ]);
 
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [10, 20] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [10, 20] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -474,7 +546,11 @@ describe("bot flow", () => {
 
   it("does not expose callback reports to unauthorized users", async () => {
     const { repo, dbPath } = setupRepo();
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [999, 555] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [999, 555] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -489,7 +565,11 @@ describe("bot flow", () => {
 
     await bot.handleUpdate(callbackUpdate(1, 123, 10, "admin:users"));
 
-    expect(calls.some((call) => call.method === "answerCallbackQuery" && String(call.payload.text).includes("Admin only."))).toBe(true);
+    expect(
+      calls.some(
+        (call) => call.method === "answerCallbackQuery" && String(call.payload.text).includes("Admin only.")
+      )
+    ).toBe(true);
     expect(calls.some((call) => String(call.payload.text).includes("<b>Users</b>"))).toBe(false);
   });
 
@@ -502,7 +582,11 @@ describe("bot flow", () => {
       repo.createSubscription(subscriberId, 123, proxyAddress, 10, 1000);
     }
 
-    const bot = createTelegramBot(testConfig(dbPath, { adminTelegramUserIds: [10] }), repo, createMockClient());
+    const bot = createTelegramBot(
+      testConfig(dbPath, { adminTelegramUserIds: [10] }),
+      repo,
+      createMockClient()
+    );
     bot.botInfo = {
       id: 999,
       is_bot: true,
@@ -517,7 +601,9 @@ describe("bot flow", () => {
 
     await bot.handleUpdate(callbackUpdate(1, 123, 10, "admin:profiles"));
 
-    const profileMessages = sendMessageCalls(calls).filter((call) => String(call.payload.text).includes("https://polymarket.com/"));
+    const profileMessages = sendMessageCalls(calls).filter((call) =>
+      String(call.payload.text).includes("https://polymarket.com/")
+    );
     expect(profileMessages.length).toBeGreaterThan(1);
   });
 

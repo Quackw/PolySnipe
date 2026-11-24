@@ -51,11 +51,16 @@ export function filterAllowedActivities(activities: readonly UserActivity[]): Us
   return activities.filter((activity) => ALLOWED_ACTIVITY_TYPES.has(activity.type.toUpperCase()));
 }
 
-export function updateWatermarkState(current: WatermarkState, activities: readonly UserActivity[]): WatermarkUpdateResult {
+export function updateWatermarkState(
+  current: WatermarkState,
+  activities: readonly UserActivity[]
+): WatermarkUpdateResult {
   const ordered = uniqueActivities([...activities].sort((a, b) => b.timestamp - a.timestamp));
   const highestTs = ordered[0]?.timestamp ?? current.lastSeenTimestamp;
   const highestKeys = unique(
-    ordered.filter((activity) => activity.timestamp === highestTs).map((activity) => buildActivityKey(activity))
+    ordered
+      .filter((activity) => activity.timestamp === highestTs)
+      .map((activity) => buildActivityKey(activity))
   ).slice(-MAX_WATERMARK_KEYS);
 
   if (!current.initialized) {

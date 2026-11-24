@@ -3,7 +3,11 @@ import { escapeHtml } from "./html.js";
 
 export const TELEGRAM_MAX_TEXT_LENGTH = 4096;
 
-export async function replyHtml(ctx: Context, html: string, extra: Record<string, unknown> = {}): Promise<void> {
+export async function replyHtml(
+  ctx: Context,
+  html: string,
+  extra: Record<string, unknown> = {}
+): Promise<void> {
   const chunks = splitForTelegram(html, 3900);
   for (const [index, chunk] of chunks.entries()) {
     await ctx.reply(chunk, {

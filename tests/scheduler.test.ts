@@ -101,7 +101,12 @@ describe("PollScheduler", () => {
         if (callCount === 1) {
           return {
             activities: [
-              { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: 1001, type: "TRADE", transactionHash: "0x1" }
+              {
+                proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+                timestamp: 1001,
+                type: "TRADE",
+                transactionHash: "0x1"
+              }
             ],
             apiCalls: 1,
             retries: 0,
@@ -133,12 +138,17 @@ describe("PollScheduler", () => {
     };
 
     const sent: Array<{ chatId: number; text: string }> = [];
-    const scheduler = new PollScheduler(testConfig(dbPath, { schedulerTickMs: 10, pollTargetIntervalSec: 1 }), repo, client, {
-      sendTelegram: async (chatId, text) => {
-        sent.push({ chatId, text });
-      },
-      log: () => {}
-    });
+    const scheduler = new PollScheduler(
+      testConfig(dbPath, { schedulerTickMs: 10, pollTargetIntervalSec: 1 }),
+      repo,
+      client,
+      {
+        sendTelegram: async (chatId, text) => {
+          sent.push({ chatId, text });
+        },
+        log: () => {}
+      }
+    );
 
     scheduler.start();
     await vi.advanceTimersByTimeAsync(50);
@@ -150,7 +160,7 @@ describe("PollScheduler", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]?.chatId).toBe(100);
     expect(sent[0]?.text).toContain('<a href="https://polymarket.com/@weflyhigh">@weflyhigh</a>');
-    expect(sent[0]?.text).toContain('<b>TRADE</b>, outcome: <b>YES</b>, side: <b>BUY</b>');
+    expect(sent[0]?.text).toContain("<b>TRADE</b>, outcome: <b>YES</b>, side: <b>BUY</b>");
     expect(repo.getAdminPerformanceReport(Date.now()).sampleCount).toBe(1);
   });
 
@@ -176,10 +186,15 @@ describe("PollScheduler", () => {
     };
     const logs: string[] = [];
 
-    const scheduler = new PollScheduler(testConfig(dbPath, { schedulerTickMs: 10, pollTargetIntervalSec: 1 }), repo, client, {
-      sendTelegram,
-      log: (line) => logs.push(line)
-    });
+    const scheduler = new PollScheduler(
+      testConfig(dbPath, { schedulerTickMs: 10, pollTargetIntervalSec: 1 }),
+      repo,
+      client,
+      {
+        sendTelegram,
+        log: (line) => logs.push(line)
+      }
+    );
 
     scheduler.start();
     await vi.advanceTimersByTimeAsync(50);
@@ -213,7 +228,12 @@ describe("PollScheduler", () => {
         if (callCount === 1) {
           return {
             activities: [
-              { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: Math.floor(Date.now() / 1000) - 5, type: "TRADE", transactionHash: "0x1" }
+              {
+                proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+                timestamp: Math.floor(Date.now() / 1000) - 5,
+                type: "TRADE",
+                transactionHash: "0x1"
+              }
             ],
             apiCalls: 1,
             retries: 0,
@@ -223,9 +243,25 @@ describe("PollScheduler", () => {
 
         return {
           activities: [
-            { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: Math.floor(Date.now() / 1000) - 5, type: "TRADE", transactionHash: "0x2", side: "BUY" },
-            { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: Math.floor(Date.now() / 1000) - 4, type: "MERGE", transactionHash: "0x3" },
-            { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: Math.floor(Date.now() / 1000) - 3, type: "REFERRAL_REWARD", transactionHash: "0x4" }
+            {
+              proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+              timestamp: Math.floor(Date.now() / 1000) - 5,
+              type: "TRADE",
+              transactionHash: "0x2",
+              side: "BUY"
+            },
+            {
+              proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+              timestamp: Math.floor(Date.now() / 1000) - 4,
+              type: "MERGE",
+              transactionHash: "0x3"
+            },
+            {
+              proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+              timestamp: Math.floor(Date.now() / 1000) - 3,
+              type: "REFERRAL_REWARD",
+              transactionHash: "0x4"
+            }
           ],
           apiCalls: 1,
           retries: 0,
@@ -234,10 +270,15 @@ describe("PollScheduler", () => {
       }
     };
 
-    const scheduler = new PollScheduler(testConfig(dbPath, { schedulerTickMs: 10, pollTargetIntervalSec: 1 }), repo, client, {
-      sendTelegram: async () => undefined,
-      log: () => {}
-    });
+    const scheduler = new PollScheduler(
+      testConfig(dbPath, { schedulerTickMs: 10, pollTargetIntervalSec: 1 }),
+      repo,
+      client,
+      {
+        sendTelegram: async () => undefined,
+        log: () => {}
+      }
+    );
 
     scheduler.start();
     await vi.advanceTimersByTimeAsync(50);
@@ -269,7 +310,12 @@ describe("PollScheduler", () => {
         if (callCount === 1) {
           return {
             activities: [
-              { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: Math.floor(Date.now() / 1000) - 5, type: "TRADE", transactionHash: "0x1" }
+              {
+                proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+                timestamp: Math.floor(Date.now() / 1000) - 5,
+                type: "TRADE",
+                transactionHash: "0x1"
+              }
             ],
             apiCalls: 1,
             retries: 0,
@@ -294,12 +340,17 @@ describe("PollScheduler", () => {
       }
     };
 
-    const scheduler = new PollScheduler(testConfig(dbPath, { schedulerTickMs: 10, pollTargetIntervalSec: 1 }), repo, client, {
-      sendTelegram: async () => {
-        throw new Error("telegram send failed");
-      },
-      log: () => {}
-    });
+    const scheduler = new PollScheduler(
+      testConfig(dbPath, { schedulerTickMs: 10, pollTargetIntervalSec: 1 }),
+      repo,
+      client,
+      {
+        sendTelegram: async () => {
+          throw new Error("telegram send failed");
+        },
+        log: () => {}
+      }
+    );
 
     scheduler.start();
     await vi.advanceTimersByTimeAsync(50);
@@ -332,7 +383,12 @@ describe("PollScheduler", () => {
         if (callCount === 1) {
           return {
             activities: [
-              { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: 1001, type: "TRADE", transactionHash: "0x1" }
+              {
+                proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+                timestamp: 1001,
+                type: "TRADE",
+                transactionHash: "0x1"
+              }
             ],
             apiCalls: 1,
             retries: 0,
@@ -342,7 +398,13 @@ describe("PollScheduler", () => {
 
         return {
           activities: [
-            { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: 1002, type: "MERGE", transactionHash: "0x2", title: "Market merge" }
+            {
+              proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+              timestamp: 1002,
+              type: "MERGE",
+              transactionHash: "0x2",
+              title: "Market merge"
+            }
           ],
           apiCalls: 1,
           retries: 0,
@@ -351,12 +413,17 @@ describe("PollScheduler", () => {
       }
     };
 
-    const scheduler = new PollScheduler(testConfig(dbPath, { schedulerTickMs: 10, pollTargetIntervalSec: 1 }), repo, client, {
-      sendTelegram: async (chatId, text) => {
-        sent.push({ chatId, text });
-      },
-      log: () => {}
-    });
+    const scheduler = new PollScheduler(
+      testConfig(dbPath, { schedulerTickMs: 10, pollTargetIntervalSec: 1 }),
+      repo,
+      client,
+      {
+        sendTelegram: async (chatId, text) => {
+          sent.push({ chatId, text });
+        },
+        log: () => {}
+      }
+    );
 
     scheduler.start();
     await vi.advanceTimersByTimeAsync(50);
@@ -383,17 +450,22 @@ describe("PollScheduler", () => {
       }
     ]);
 
-    const scheduler = new PollScheduler(testConfig(dbPath, { heartbeatEveryMs: 100 }), repo, {
-      async resolveAccountInput() {
-        throw new Error("not used");
+    const scheduler = new PollScheduler(
+      testConfig(dbPath, { heartbeatEveryMs: 100 }),
+      repo,
+      {
+        async resolveAccountInput() {
+          throw new Error("not used");
+        },
+        async fetchRecentUserActivity() {
+          return { activities: [], apiCalls: 1, retries: 0, throttleWaitMs: 0 };
+        }
       },
-      async fetchRecentUserActivity() {
-        return { activities: [], apiCalls: 1, retries: 0, throttleWaitMs: 0 };
+      {
+        sendTelegram: async () => undefined,
+        log: () => {}
       }
-    }, {
-      sendTelegram: async () => undefined,
-      log: () => {}
-    });
+    );
 
     scheduler.start();
     await vi.advanceTimersByTimeAsync(150);
@@ -424,7 +496,12 @@ describe("PollScheduler", () => {
         if (callCount === 1) {
           return {
             activities: [
-              { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: 1_001, type: "TRADE", transactionHash: "0x1" }
+              {
+                proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+                timestamp: 1_001,
+                type: "TRADE",
+                transactionHash: "0x1"
+              }
             ],
             apiCalls: 1,
             retries: 0,
@@ -434,7 +511,12 @@ describe("PollScheduler", () => {
 
         return {
           activities: [
-            { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: 1_002, type: "TRADE", transactionHash: "0x2" }
+            {
+              proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+              timestamp: 1_002,
+              type: "TRADE",
+              transactionHash: "0x2"
+            }
           ],
           apiCalls: 1,
           retries: 0,
@@ -444,14 +526,19 @@ describe("PollScheduler", () => {
     };
     const logs: string[] = [];
 
-    const scheduler = new PollScheduler(testConfig(dbPath, {
-      schedulerTickMs: 10,
-      pollTargetIntervalSec: 1,
-      alertDelayThresholdSec: 30
-    }), repo, client, {
-      sendTelegram: async () => undefined,
-      log: (line) => logs.push(line)
-    });
+    const scheduler = new PollScheduler(
+      testConfig(dbPath, {
+        schedulerTickMs: 10,
+        pollTargetIntervalSec: 1,
+        alertDelayThresholdSec: 30
+      }),
+      repo,
+      client,
+      {
+        sendTelegram: async () => undefined,
+        log: (line) => logs.push(line)
+      }
+    );
 
     scheduler.start();
     await vi.advanceTimersByTimeAsync(50);
@@ -463,7 +550,9 @@ describe("PollScheduler", () => {
     expect(report.upstreamStaleCount).toBe(1);
     expect(report.delayReasonCounts.find((item) => item.reason === "upstream_stale")?.count).toBe(1);
     expect(logs.some((line) => line.includes("[alert:stale_batch]"))).toBe(true);
-    expect(logs.some((line) => line.includes("[alert:delay]") && line.includes("reason=upstream_stale"))).toBe(true);
+    expect(
+      logs.some((line) => line.includes("[alert:delay]") && line.includes("reason=upstream_stale"))
+    ).toBe(true);
   });
 
   it("keeps per-chat send failures isolated and still records successful alert samples", async () => {
@@ -490,7 +579,12 @@ describe("PollScheduler", () => {
         if (callCount === 1) {
           return {
             activities: [
-              { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: Math.floor(Date.now() / 1000) - 5, type: "TRADE", transactionHash: "0x1" }
+              {
+                proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+                timestamp: Math.floor(Date.now() / 1000) - 5,
+                type: "TRADE",
+                transactionHash: "0x1"
+              }
             ],
             apiCalls: 1,
             retries: 0,
@@ -500,7 +594,12 @@ describe("PollScheduler", () => {
 
         return {
           activities: [
-            { proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", timestamp: Math.floor(Date.now() / 1000) - 5, type: "TRADE", transactionHash: "0x2" }
+            {
+              proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+              timestamp: Math.floor(Date.now() / 1000) - 5,
+              type: "TRADE",
+              transactionHash: "0x2"
+            }
           ],
           apiCalls: 1,
           retries: 0,
@@ -511,19 +610,24 @@ describe("PollScheduler", () => {
     const logs: string[] = [];
     const sentChats: number[] = [];
 
-    const scheduler = new PollScheduler(testConfig(dbPath, {
-      schedulerTickMs: 10,
-      pollTargetIntervalSec: 1,
-      alertSendConcurrency: 2
-    }), repo, client, {
-      sendTelegram: async (chatId) => {
-        if (chatId === 100) {
-          throw new Error("chat blocked");
-        }
-        sentChats.push(chatId);
-      },
-      log: (line) => logs.push(line)
-    });
+    const scheduler = new PollScheduler(
+      testConfig(dbPath, {
+        schedulerTickMs: 10,
+        pollTargetIntervalSec: 1,
+        alertSendConcurrency: 2
+      }),
+      repo,
+      client,
+      {
+        sendTelegram: async (chatId) => {
+          if (chatId === 100) {
+            throw new Error("chat blocked");
+          }
+          sentChats.push(chatId);
+        },
+        log: (line) => logs.push(line)
+      }
+    );
 
     scheduler.start();
     await vi.advanceTimersByTimeAsync(50);
@@ -537,50 +641,124 @@ describe("PollScheduler", () => {
 });
 
 it("incomplete v2 traversal leaves persisted watermark unchanged and sends nothing", async () => {
-  vi.useFakeTimers();vi.setSystemTime(new Date("2026-10-23T08:00:00Z"));
-  const {repo,dbPath}=setupRepo();
-  const wallet="0x03e8a544e97eeff5753bc1e90d46e5ef22af1697";
-  const subscriberId=repo.upsertSubscriber(1,100,"private");
-  repo.upsertTrackedAccount({proxyAddress:wallet,nextPollAtMs:0});
-  repo.createSubscription(subscriberId,100,wallet,1,0);
-  repo.markPollSuccess({proxyAddress:wallet,lastSeenTimestamp:110,lastSeenKeys:["legacy-key"],lastPolledAtMs:1,nextPollAtMs:0});
-  const sendTelegram=vi.fn(async()=>undefined);
-  vi.stubGlobal("fetch",vi.fn(async()=>new Response(JSON.stringify({
-    data:[{proxy_wallet:wallet,timestamp:120,type:"TRADE",transaction_hash:"0x1"}],
-    pagination:{next_cursor:"repeated",has_more:true}
-  }),{status:200})));
-  const config=testConfig(dbPath,{activityMaxPages:2});
-  const scheduler=new PollScheduler(config,repo,new DefaultPolymarketClient(config),{sendTelegram,log:()=>{}});
-  try{
-    scheduler.start();await vi.advanceTimersByTimeAsync(100);await scheduler.stopAndDrain();
-    const stored=repo.getTrackedAccount(wallet)!;
-    expect(stored.lastSeenTimestamp).toBe(110);expect(stored.lastSeenKeys).toEqual(["legacy-key"]);
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-10-23T08:00:00Z"));
+  const { repo, dbPath } = setupRepo();
+  const wallet = "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697";
+  const subscriberId = repo.upsertSubscriber(1, 100, "private");
+  repo.upsertTrackedAccount({ proxyAddress: wallet, nextPollAtMs: 0 });
+  repo.createSubscription(subscriberId, 100, wallet, 1, 0);
+  repo.markPollSuccess({
+    proxyAddress: wallet,
+    lastSeenTimestamp: 110,
+    lastSeenKeys: ["legacy-key"],
+    lastPolledAtMs: 1,
+    nextPollAtMs: 0
+  });
+  const sendTelegram = vi.fn(async () => undefined);
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            data: [{ proxy_wallet: wallet, timestamp: 120, type: "TRADE", transaction_hash: "0x1" }],
+            pagination: { next_cursor: "repeated", has_more: true }
+          }),
+          { status: 200 }
+        )
+    )
+  );
+  const config = testConfig(dbPath, { activityMaxPages: 2 });
+  const scheduler = new PollScheduler(config, repo, new DefaultPolymarketClient(config), {
+    sendTelegram,
+    log: () => {}
+  });
+  try {
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(100);
+    await scheduler.stopAndDrain();
+    const stored = repo.getTrackedAccount(wallet)!;
+    expect(stored.lastSeenTimestamp).toBe(110);
+    expect(stored.lastSeenKeys).toEqual(["legacy-key"]);
     expect(sendTelegram).not.toHaveBeenCalled();
-    const diskRepo=new AppRepository(openDb(dbPath));
-    try{expect(diskRepo.getTrackedAccount(wallet)?.lastSeenKeys).toEqual(["legacy-key"]);}finally{diskRepo.close();}
-  }finally{scheduler.stop();vi.unstubAllGlobals();}
+    const diskRepo = new AppRepository(openDb(dbPath));
+    try {
+      expect(diskRepo.getTrackedAccount(wallet)?.lastSeenKeys).toEqual(["legacy-key"]);
+    } finally {
+      diskRepo.close();
+    }
+  } finally {
+    scheduler.stop();
+    vi.unstubAllGlobals();
+  }
 });
 
-it("v2 duplicate rows and reopening the saved database do not resend an acknowledged event",async()=>{
-  vi.useFakeTimers();vi.setSystemTime(new Date(200000));
-  const {repo,dbPath}=setupRepo();const wallet="0x03e8a544e97eeff5753bc1e90d46e5ef22af1697";
-  const subscriberId=repo.upsertSubscriber(1,100,"private");
-  repo.upsertTrackedAccount({proxyAddress:wallet,nextPollAtMs:0});
-  repo.createSubscription(subscriberId,100,wallet,1,0);
-  repo.markPollSuccess({proxyAddress:wallet,lastSeenTimestamp:110,lastSeenKeys:["old"],lastPolledAtMs:1,nextPollAtMs:0});
-  const row={proxy_wallet:wallet,timestamp:120,type:"TRADE",transaction_hash:"0x1",condition_id:"0xc",token_id:"123",size:2,usdc_size:1};
-  vi.stubGlobal("fetch",vi.fn(async()=>new Response(JSON.stringify({data:[row,row],pagination:{next_cursor:null,has_more:false}}),{status:200})));
-  const sendTelegram=vi.fn(async()=>undefined),config=testConfig(dbPath);
-  const first=new PollScheduler(config,repo,new DefaultPolymarketClient(config),{sendTelegram,log:()=>{}});
-  try{
-    first.start();await vi.advanceTimersByTimeAsync(100);await first.stopAndDrain();
+it("v2 duplicate rows and reopening the saved database do not resend an acknowledged event", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(200000));
+  const { repo, dbPath } = setupRepo();
+  const wallet = "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697";
+  const subscriberId = repo.upsertSubscriber(1, 100, "private");
+  repo.upsertTrackedAccount({ proxyAddress: wallet, nextPollAtMs: 0 });
+  repo.createSubscription(subscriberId, 100, wallet, 1, 0);
+  repo.markPollSuccess({
+    proxyAddress: wallet,
+    lastSeenTimestamp: 110,
+    lastSeenKeys: ["old"],
+    lastPolledAtMs: 1,
+    nextPollAtMs: 0
+  });
+  const row = {
+    proxy_wallet: wallet,
+    timestamp: 120,
+    type: "TRADE",
+    transaction_hash: "0x1",
+    condition_id: "0xc",
+    token_id: "123",
+    size: 2,
+    usdc_size: 1
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ data: [row, row], pagination: { next_cursor: null, has_more: false } }),
+          { status: 200 }
+        )
+    )
+  );
+  const sendTelegram = vi.fn(async () => undefined),
+    config = testConfig(dbPath);
+  const first = new PollScheduler(config, repo, new DefaultPolymarketClient(config), {
+    sendTelegram,
+    log: () => {}
+  });
+  try {
+    first.start();
+    await vi.advanceTimersByTimeAsync(100);
+    await first.stopAndDrain();
     expect(sendTelegram).toHaveBeenCalledTimes(1);
     expect(repo.getTrackedAccount(wallet)?.lastSeenTimestamp).toBe(120);
-    const reopened=new AppRepository(openDb(dbPath));
-    const second=new PollScheduler(config,reopened,new DefaultPolymarketClient(config),{sendTelegram,log:()=>{}});
-    try{
-      await vi.advanceTimersByTimeAsync(6000);second.start();await vi.advanceTimersByTimeAsync(100);await second.stopAndDrain();
-      expect(sendTelegram).toHaveBeenCalledTimes(1);expect(reopened.getTrackedAccount(wallet)?.lastSeenKeys).toHaveLength(1);
-    }finally{second.stop();reopened.close();}
-  }finally{first.stop();vi.unstubAllGlobals();}
+    const reopened = new AppRepository(openDb(dbPath));
+    const second = new PollScheduler(config, reopened, new DefaultPolymarketClient(config), {
+      sendTelegram,
+      log: () => {}
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(6000);
+      second.start();
+      await vi.advanceTimersByTimeAsync(100);
+      await second.stopAndDrain();
+      expect(sendTelegram).toHaveBeenCalledTimes(1);
+      expect(reopened.getTrackedAccount(wallet)?.lastSeenKeys).toHaveLength(1);
+    } finally {
+      second.stop();
+      reopened.close();
+    }
+  } finally {
+    first.stop();
+    vi.unstubAllGlobals();
+  }
 });
