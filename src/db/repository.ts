@@ -693,7 +693,7 @@ export class AppRepository {
       return { removedSubscriptions, removedTrackedAccounts };
     });
 
-    return tx(chatId, proxyAddress.toLowerCase());
+    return tx.immediate(chatId, proxyAddress.toLowerCase());
   }
 
   public removeAllSubscriptions(chatId: number): { removedSubscriptions: number; removedTrackedAccounts: number } {
@@ -725,7 +725,7 @@ export class AppRepository {
       return { removedSubscriptions, removedTrackedAccounts };
     });
 
-    return tx(chatId);
+    return tx.immediate(chatId);
   }
 
   public cleanupTrackedAccountIfOrphaned(proxyAddress: string): number {

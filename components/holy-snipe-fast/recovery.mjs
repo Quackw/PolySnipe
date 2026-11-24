@@ -43,27 +43,28 @@ export function recoveryController(db, {root, ownerIds, enabledDirect, getSendOn
     if(a.send_started_ms||['RECOVERY_CANCELLED_BEFORE_SEND','RECOVERY_STOPPED'].includes(a.state))return;
     const claim=claimFor(a.action_key,a.chat_id);
     if(!claim||claim.first_event_key!==a.event_key||claim.first_trace_id!==a.reservation_trace_id)return;
-    const d=db.prepare('SELECT state FROM deliveries WHERE event_key=? AND chat_id=?').get(a.event_key,a.chat_id);
-    if(!d||!['PENDING','SENDING','RECOVERY_STOPPED','RECOVERY_CANCELLED_BEFORE_SEND'].includes(d.state))return;
+    const released=db.prepare("DELETE FROM deliveries WHERE event_key=? AND chat_id=? AND state='PENDING'").run(a.event_key,a.chat_id);
+    if(released.changes!==1)return;
     db.prepare('DELETE FROM send_once_actions WHERE action_key=? AND chat_id=? AND first_event_key=?').run(a.action_key,a.chat_id,a.event_key);
-    db.prepare('DELETE FROM deliveries WHERE event_key=? AND chat_id=?').run(a.event_key,a.chat_id);
   }
   function stop(reason) {
     if (!config) return;
     try {fs.writeFileSync(stopFile,JSON.stringify({at:now(),reason})+'\n',{flag:'wx',mode:0o600});}
     catch(e) {if(e.code!=='EEXIST') throw e;}
-    if(actionMode){
-      db.transaction(()=>{
+    db.transaction(()=>{
+      if(actionMode){
         for(const a of db.prepare('SELECT * FROM recovery_canary_audit WHERE rest_first_seen_ms>=? AND send_started_ms IS NULL').all(config.start_ms??Number.MAX_SAFE_INTEGER)){
-          releaseUnsent(a);db.prepare("UPDATE recovery_canary_audit SET state='RECOVERY_STOPPED' WHERE event_key=? AND chat_id=? AND state NOT IN ('RECOVERY_CANCELLED_BEFORE_SEND','DELIVERED')").run(a.event_key,a.chat_id);
+          releaseUnsent(a);
+          db.prepare("UPDATE recovery_canary_audit SET state='RECOVERY_STOPPED' WHERE event_key=? AND chat_id=? AND state NOT IN ('RECOVERY_CANCELLED_BEFORE_SEND','DELIVERED')").run(a.event_key,a.chat_id);
         }
-      })();return;
-    }
-    db.prepare(`UPDATE deliveries SET state='RECOVERY_STOPPED',next_at_ms=0 WHERE
-      EXISTS(SELECT 1 FROM recovery_canary_audit a WHERE a.event_key=deliveries.event_key AND a.chat_id=deliveries.chat_id
-        AND a.state!='RECOVERY_CANCELLED_BEFORE_SEND')
-      AND state IN ('PENDING','FAILED_RETRYABLE','DELIVERY_UNKNOWN')`).run();
-    db.prepare("UPDATE recovery_canary_audit SET state='RECOVERY_STOPPED' WHERE state='PENDING' AND send_started_ms IS NULL").run();
+        return;
+      }
+      db.prepare(`UPDATE deliveries SET state='RECOVERY_STOPPED',next_at_ms=0 WHERE
+        EXISTS(SELECT 1 FROM recovery_canary_audit a WHERE a.event_key=deliveries.event_key AND a.chat_id=deliveries.chat_id
+          AND a.state!='RECOVERY_CANCELLED_BEFORE_SEND')
+        AND state IN ('PENDING','FAILED_RETRYABLE')`).run();
+      db.prepare("UPDATE recovery_canary_audit SET state='RECOVERY_STOPPED' WHERE state='PENDING' AND send_started_ms IS NULL").run();
+    }).immediate();
   }
   function allowed() {
     if (!validConfig() || !config.start_ms || fs.existsSync(stopFile)) return false;
@@ -152,11 +153,11 @@ export function recoveryController(db, {root, ownerIds, enabledDirect, getSendOn
     if(!Number.isFinite(req.deadline_state_age_ms)||req.deadline_state_age_ms>2000||req.deadline_state_age_ms<0||
       !Number.isFinite(req.grace_elapsed_ms)||req.grace_elapsed_ms<20000||!['reconnect','periodic'].includes(req.origin)||
       !Number.isFinite(req.rest_first_seen_ms)||req.rest_first_seen_ms<config.start_ms||req.rest_first_seen_ms>now()+5000) throw Error('INVALID_DEADLINE');
-    const selected=scope().filter(r=>r.wallet.toLowerCase()===t.wallet&&t.timestamp>=r.notify_from_ts);
-    if(selected.length!==1)throw Error('CANARY_SCOPE_CHANGED');
-    const recipient=selected[0];
+    const checkStart=mono();
     return db.transaction(()=>{
-      const checkStart=mono();
+      const selected=scope().filter(r=>r.wallet.toLowerCase()===t.wallet&&t.timestamp>=r.notify_from_ts);
+      if(selected.length!==1)throw Error('CANARY_SCOPE_CHANGED');
+      const recipient=selected[0];
       if(present(req.key,recipient.chat_id))return {nonce:req.nonce,key:req.key,status:'RECOVERY_CANCELLED_BEFORE_SEND'};
       const elapsed=mono()-checkStart;if(elapsed>2000)throw Error('FINAL_STATE_TOO_STALE');
       db.prepare(`INSERT INTO recovery_canary_audit(event_key,chat_id,trade_json,rest_first_seen_ms,grace_deadline_ms,
@@ -166,8 +167,9 @@ export function recoveryController(db, {root, ownerIds, enabledDirect, getSendOn
       db.prepare(`INSERT INTO deliveries(event_key,chat_id,wallet,source_timestamp,first_seen_at_ms,message_html,state,next_at_ms)
         VALUES(?,?,?,?,?,?,'PENDING',?)`).run(req.key,recipient.chat_id,t.wallet,t.timestamp,req.rest_first_seen_ms,
           formatAlert(t,recipient),now());
+      if(mono()-checkStart>2000)throw Error('FINAL_STATE_TOO_STALE');
       return {nonce:req.nonce,key:req.key,status:'RECOVERY_QUEUED'};
-    })();
+    }).immediate();
   }
   function enqueueAction(req,t){
     if(!t||req.raw.type!=='TRADE'||userActionKey(t)!==req.key||!config.subscriptions.some(s=>s.wallet===t.wallet)){
@@ -178,12 +180,15 @@ export function recoveryController(db, {root, ownerIds, enabledDirect, getSendOn
       !Number.isFinite(req.rest_first_seen_ms)||req.rest_first_seen_ms<config.start_ms||req.rest_first_seen_ms>now()||
       now()-req.rest_first_seen_ms<20000||!['reconnect','periodic'].includes(req.origin)||
       !Array.isArray(req.recipients)||req.recipients.length===0||new Set(req.recipients).size!==req.recipients.length)throw Error('INVALID_DEADLINE_OR_SCOPE');
-    const selected=scope().filter(s=>s.wallet.toLowerCase()===t.wallet&&t.timestamp>=s.notify_from_ts&&req.recipients.includes(createHmac('sha256',req.salt).update(String(s.chat_id)).digest('hex').slice(0,24)));
-    if(selected.length!==req.recipients.length)throw Error('CANARY_SCOPE_CHANGED');
+    const check=mono();
+    const sendOnce=getSendOnce();
+    sendOnce.refreshRollback();
     return db.transaction(()=>{
+      const selected=scope().filter(s=>s.wallet.toLowerCase()===t.wallet&&t.timestamp>=s.notify_from_ts&&req.recipients.includes(createHmac('sha256',req.salt).update(String(s.chat_id)).digest('hex').slice(0,24)));
+      if(selected.length!==req.recipients.length)throw Error('CANARY_SCOPE_CHANGED');
       const results=[];
       for(const recipient of selected){
-        const check=mono(),chat=recipient.chat_id;
+        const chat=recipient.chat_id;
         const token=createHmac('sha256',req.salt).update(String(chat)).digest('hex').slice(0,24);
         if(present(req.key,chat)){results.push({recipient:token,status:'RECOVERY_CANCELLED_BEFORE_SEND'});continue;}
         const fill=eventKey(t),identity=userActionIdentity(t);
@@ -191,7 +196,7 @@ export function recoveryController(db, {root, ownerIds, enabledDirect, getSendOn
         if(existing){results.push({recipient:token,status:'RECOVERY_CANCELLED_BEFORE_SEND'});continue;}
         if(mono()-check>2000)throw Error('FINAL_STATE_TOO_STALE');
         const traceId=traceRecovery?.('begin',req.raw,chat,fill)??('rest-recovery:'+config.run_id+':'+req.key);
-        const admitted=getSendOnce().admit(t,chat,fill,traceId,formatAlert(t,recipient),now(),req.rest_first_seen_ms);
+        const admitted=sendOnce.admit(t,chat,fill,traceId,formatAlert(t,recipient),now(),req.rest_first_seen_ms);
         if(admitted.kind!=='SEND_FIRST_ACTION'){stop('SHARED_ACTION_ADMISSION_FAILED');throw Error('SHARED_ACTION_ADMISSION_FAILED');}
         const cl=claimFor(req.key,chat);
         if(!cl||cl.identity_json!==identity||cl.first_event_key!==fill)throw Error('SHARED_ACTION_RESERVATION_FAILED');
@@ -200,14 +205,29 @@ export function recoveryController(db, {root, ownerIds, enabledDirect, getSendOn
         traceRecovery?.('queue',traceId,chat,fill,req.raw);
         results.push({recipient:token,status:'RECOVERY_QUEUED'});
       }
+      if(mono()-check>2000)throw Error('FINAL_STATE_TOO_STALE');
       return {nonce:req.nonce,key:req.key,status:results.some(r=>r.status==='RECOVERY_QUEUED')?'RECOVERY_QUEUED':'RECOVERY_CANCELLED_BEFORE_SEND',results};
-    })();
+    }).immediate();
   }
   // Called synchronously inside the same transaction as the existing sender claim.
   function beforeClaim(row) {
     const a=audit(row.event_key,row.chat_id);
-    if(!a || (!a.send_started_ms&&(a.state==='RECOVERY_CANCELLED_BEFORE_SEND'||(actionMode&&a.state==='RECOVERY_STOPPED'))))return {allow:true,isRest:false};
-    if(!allowed())return {allow:false,isRest:true};
+    if(!a)return {allow:true,isRest:false};
+    if(!a.send_started_ms&&['RECOVERY_CANCELLED_BEFORE_SEND','RECOVERY_STOPPED'].includes(a.state)){
+      // An existing audit can describe a recovery row already replaced by FAST.
+      const claim=actionMode?claimFor(a.action_key,row.chat_id):null;
+      const stillRecovery=actionMode
+        ?claim?.first_event_key===a.event_key&&claim.first_trace_id===a.reservation_trace_id
+        :row.first_seen_at_ms===a.rest_first_seen_ms;
+      if(!stillRecovery)return {allow:true,isRest:false};
+      db.prepare("UPDATE deliveries SET state=?,next_at_ms=0 WHERE event_key=? AND chat_id=? AND state IN ('PENDING','FAILED_RETRYABLE')").run(a.state,row.event_key,row.chat_id);
+      return {allow:false,isRest:true};
+    }
+    if(!allowed()){
+      db.prepare("UPDATE deliveries SET state='RECOVERY_STOPPED',next_at_ms=0 WHERE event_key=? AND chat_id=? AND state IN ('PENDING','FAILED_RETRYABLE')").run(row.event_key,row.chat_id);
+      db.prepare("UPDATE recovery_canary_audit SET state='RECOVERY_STOPPED' WHERE event_key=? AND chat_id=? AND send_started_ms IS NULL").run(row.event_key,row.chat_id);
+      return {allow:false,isRest:true};
+    }
     const started=mono(), s=scope().find(r=>r.chat_id===row.chat_id&&r.wallet.toLowerCase()===row.wallet&&row.source_timestamp>=r.notify_from_ts);
     if(!s||present(row.event_key,row.chat_id,true)) {
       if(actionMode)releaseUnsent(a);
@@ -229,20 +249,20 @@ export function recoveryController(db, {root, ownerIds, enabledDirect, getSendOn
       if(!a||!cl||cl.first_event_key!==row.event_key||cl.first_trace_id!==a.reservation_trace_id||cl.identity_json!==userActionIdentity(t)||row.wallet!==t.wallet||row.source_timestamp!==t.timestamp){stop('WRONG_RECOVERY_ACTION');return false;}
     }
     const selected=scope().some(s=>s.chat_id===row.chat_id&&s.wallet.toLowerCase()===row.wallet&&row.source_timestamp>=s.notify_from_ts);
-    if(!allowed()||!selected||present(row.event_key,row.chat_id,true)||mono()-start>2000) {
-      const a=audit(row.event_key,row.chat_id);
-      if(!a?.send_started_ms) {
-        if(actionMode&&a)releaseUnsent(a);
-        db.prepare("DELETE FROM deliveries WHERE event_key=? AND chat_id=? AND state='SENDING'").run(row.event_key,row.chat_id);
-        db.prepare("UPDATE recovery_canary_audit SET state='RECOVERY_CANCELLED_BEFORE_SEND' WHERE event_key=? AND chat_id=?").run(row.event_key,row.chat_id);
-      } else db.prepare("UPDATE deliveries SET state='RECOVERY_STOPPED',next_at_ms=0 WHERE event_key=? AND chat_id=?").run(row.event_key,row.chat_id);
-      return false;
-    }
-    db.prepare(`UPDATE recovery_canary_audit SET final_check_ms=?,final_state_age_ms=?,send_started_ms=COALESCE(send_started_ms,?),
-      attempt_count=attempt_count+1,state='SENDING' WHERE event_key=? AND chat_id=?`).run(now(),mono()-start,now(),row.event_key,row.chat_id);
+    if(!allowed()||!selected||present(row.event_key,row.chat_id,true))return false;
+    const age=mono()-start;
+    if(age>2000)return false;
+    row.recoveryFinalCheck={at:now(),age};
     return true;
   }
+  function markSendStarted(row) {
+    if(!row.isRestRecovery)return;
+    const {at,age}=row.recoveryFinalCheck;
+    db.prepare(`UPDATE recovery_canary_audit SET final_check_ms=?,final_state_age_ms=?,send_started_ms=COALESCE(send_started_ms,?),
+      attempt_count=attempt_count+1,state='SENDING' WHERE event_key=? AND chat_id=?`).run(at,age,now(),row.event_key,row.chat_id);
+  }
   function onDirect(key,received,trade) {
+    if(!config)return;
     if(actionMode){
       if(!trade)return;
       const action=userActionKey(trade);
@@ -251,17 +271,18 @@ export function recoveryController(db, {root, ownerIds, enabledDirect, getSendOn
           db.prepare('UPDATE recovery_canary_audit SET late_fast_ms=COALESCE(late_fast_ms,?) WHERE event_key=? AND chat_id=?').run(received,a.event_key,a.chat_id);
           if(!a.send_started_ms){releaseUnsent(a);db.prepare("UPDATE recovery_canary_audit SET state='RECOVERY_CANCELLED_BEFORE_SEND' WHERE event_key=? AND chat_id=?").run(a.event_key,a.chat_id);}
         }
-      })();return;
+      }).immediate();return;
     }
-    for(const a of db.prepare('SELECT * FROM recovery_canary_audit WHERE event_key=?').all(key)) {
-      db.prepare('UPDATE recovery_canary_audit SET late_fast_ms=COALESCE(late_fast_ms,?) WHERE event_key=? AND chat_id=?').run(received,key,a.chat_id);
-      if(!a.send_started_ms) {
-        db.prepare("DELETE FROM deliveries WHERE event_key=? AND chat_id=? AND state='PENDING'").run(key,a.chat_id);
-        db.prepare("UPDATE recovery_canary_audit SET state='RECOVERY_CANCELLED_BEFORE_SEND' WHERE event_key=? AND chat_id=?").run(key,a.chat_id);
+    db.transaction(()=>{
+      for(const a of db.prepare('SELECT * FROM recovery_canary_audit WHERE event_key=?').all(key)) {
+        db.prepare('UPDATE recovery_canary_audit SET late_fast_ms=COALESCE(late_fast_ms,?) WHERE event_key=? AND chat_id=?').run(received,key,a.chat_id);
+        if(!a.send_started_ms) {
+          db.prepare("DELETE FROM deliveries WHERE event_key=? AND chat_id=? AND state='PENDING'").run(key,a.chat_id);
+          db.prepare("UPDATE recovery_canary_audit SET state='RECOVERY_CANCELLED_BEFORE_SEND' WHERE event_key=? AND chat_id=?").run(key,a.chat_id);
+        }
+        // A claimed or ambiguous delivery keeps its canonical reservation.
       }
-      // Once claimed, the canonical PK remains reserved even after ambiguous delivery.
-      // The normal direct INSERT OR IGNORE therefore cannot produce a second card.
-    }
+    }).immediate();
   }
   function afterSend(row,result,state,delivered) {
     if(!row.isRestRecovery)return;
@@ -307,5 +328,5 @@ export function recoveryController(db, {root, ownerIds, enabledDirect, getSendOn
     });server.listen(socket,()=>fs.chmodSync(socket,0o600));
   }
   function observeSafely(fn,...args){try{return fn(...args);}catch{try{stop('RECOVERY_OBSERVATION_ERROR');}catch{}}}
-  return {call,listen,close:()=>server?.close(),beforeClaim,beforeSend,onDirect,onDirectAction:actionMode?(trade,received)=>observeSafely(onDirect,eventKey(trade),received,trade):undefined,onSuppressed:(...args)=>observeSafely(onSuppressed,...args),afterSend,stop,stats};
+  return {call,listen,close:()=>server?.close(),beforeClaim,beforeSend,markSendStarted,onDirect,onDirectAction:actionMode?(trade,received)=>observeSafely(onDirect,eventKey(trade),received,trade):undefined,onSuppressed:(...args)=>observeSafely(onSuppressed,...args),afterSend,stop,stats};
 }

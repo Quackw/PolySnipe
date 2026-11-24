@@ -1,6 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {normalizeAddress,userActionIdentity,userActionKey} from './identity.mjs';
+import {isRetryableSqliteLock} from './sqlite-lock.mjs';
+
+export const MAX_TRACKED_ACK_IDS = 4096;
 
 export function createSendOnce(db,{root,ownerIds,recipientMap,insert,now=Date.now,dynamicProtected=false}) {
   const file=path.join(root,'send-once-canary.json');
@@ -57,10 +60,16 @@ export function createSendOnce(db,{root,ownerIds,recipientMap,insert,now=Date.no
   const stats={send_first_action:0,suppress_same_action:0,false_user_action_merges:0,
     first_direct_event_dropped:0,legacy_after_rollback:0,admission_errors:0,duplicate_telegram_alerts:0};
   const ackIds=new Map();
+  let rollbackMarked = fs.existsSync(rollbackFile);
+  function refreshRollback() {
+    // Nested admission uses the flag refreshed by the outer writer.
+    if (!db.inTransaction) rollbackMarked = fs.existsSync(rollbackFile);
+    return rollbackMarked;
+  }
   const actionForEvent=db.prepare('SELECT action_key FROM send_once_actions WHERE first_event_key=? AND chat_id=?');
   const admitTx=db.transaction((trade,recipient,fillKey,traceId,html,nextAt,seenAt)=>{
     const actionKey=userActionKey(trade),identity=userActionIdentity(trade);
-    if(fs.existsSync(rollbackFile))return {kind:'LEGACY_AFTER_ROLLBACK',actionKey};
+    if(rollbackMarked)return {kind:'LEGACY_AFTER_ROLLBACK',actionKey};
     const prior=get.get(actionKey,recipient);
     if(prior)return prior.identity_json===identity
       ?{kind:'SUPPRESS_SAME_ACTION',actionKey,firstEventKey:prior.first_event_key,firstTraceId:prior.first_trace_id}
@@ -73,21 +82,32 @@ export function createSendOnce(db,{root,ownerIds,recipientMap,insert,now=Date.no
   function rollback(reason){
     try{fs.writeFileSync(rollbackFile,`${new Date(now()).toISOString()} ${reason}\n`,{flag:'wx',mode:0o600});}
     catch(e){if(e.code!=='EEXIST')throw e;}
+    rollbackMarked = true;
   }
   function applies(wallet,recipient){return dynamicProtected?typeof wallet==='string'&&normalizeAddress(wallet)===wallet&&Number.isSafeInteger(recipient)&&recipient>0:expanded?pairs.has(wallet+'|'+recipient):recipient===config.recipient&&wallets.has(wallet);}
   function observeAck(row,result){
-    if(result.kind!=='OK'||!applies(row.wallet,row.chat_id)||fs.existsSync(rollbackFile))return;
+    if(result.kind!=='OK'||!applies(row.wallet,row.chat_id)||refreshRollback())return;
     const action=actionForEvent.get(row.event_key,row.chat_id);
     if(!action)return;
     const key=action.action_key+'|'+row.chat_id,id=result.value?.result?.message_id;
     if(!Number.isSafeInteger(id)||id<=0)return;
     if(ackIds.has(key)&&ackIds.get(key)!==id){stats.duplicate_telegram_alerts++;rollback('DUPLICATE_TELEGRAM_ALERT');}
-    else ackIds.set(key,id);
+    else {
+      // Refresh the recency of repeated acknowledgements before eviction.
+      ackIds.delete(key);
+      ackIds.set(key,id);
+      if (ackIds.size > MAX_TRACKED_ACK_IDS) ackIds.delete(ackIds.keys().next().value);
+    }
   }
   function admit(trade,recipient,fillKey,traceId,html,nextAt,seenAt){
     let result;
-    try{result=admitTx(trade,recipient,fillKey,traceId,html,nextAt,seenAt);}
-    catch(e){stats.admission_errors++;rollback('ACTION_ADMISSION_ERROR');throw e;}
+    refreshRollback();
+    try{result=admitTx.immediate(trade,recipient,fillKey,traceId,html,nextAt,seenAt);}
+    catch(e){
+      stats.admission_errors++;
+      if(!isRetryableSqliteLock(e))rollback('ACTION_ADMISSION_ERROR');
+      throw e;
+    }
     if(result.kind==='SEND_FIRST_ACTION')stats.send_first_action++;
     if(result.kind==='SUPPRESS_SAME_ACTION')stats.suppress_same_action++;
     if(result.kind==='FALSE_USER_ACTION_MERGE'){stats.false_user_action_merges++;rollback('FALSE_USER_ACTION_MERGE');}
@@ -98,7 +118,7 @@ export function createSendOnce(db,{root,ownerIds,recipientMap,insert,now=Date.no
   function snapshot(){
     const rows=latencies.all(config.start_ms).map(r=>Math.max(0,r.ms)).sort((a,b)=>a-b);
     const n=counts.get(config.start_ms);
-    return {start_ms:config.start_ms,scope_wallets:wallets.size,scope_subscriptions:expanded?pairs.size:wallets.size,scope_mode:dynamicProtected?'DYNAMIC_PROTECTED':expanded?'FROZEN_CURRENT_SUBSCRIPTIONS':'OWNER_SIX',rollback:fs.existsSync(rollbackFile),
+    return {start_ms:config.start_ms,scope_wallets:wallets.size,scope_subscriptions:expanded?pairs.size:wallets.size,scope_mode:dynamicProtected?'DYNAMIC_PROTECTED':expanded?'FROZEN_CURRENT_SUBSCRIPTIONS':'OWNER_SIX',rollback:refreshRollback(),
       user_actions_seen:n.n,send_first_action:stats.send_first_action,
       suppress_same_action:stats.suppress_same_action,
       false_user_action_merges:stats.false_user_action_merges,
@@ -107,8 +127,9 @@ export function createSendOnce(db,{root,ownerIds,recipientMap,insert,now=Date.no
       latency_ms:{n:rows.length,median:rows[Math.floor((rows.length-1)*.5)]??null,
         p90:rows[Math.floor((rows.length-1)*.9)]??null,max:rows.at(-1)??null},
       duplicate_telegram_alerts:stats.duplicate_telegram_alerts,
-      admission_errors:stats.admission_errors,legacy_after_rollback:stats.legacy_after_rollback};
+      admission_errors:stats.admission_errors,legacy_after_rollback:stats.legacy_after_rollback,
+      tracked_ack_ids:ackIds.size};
   }
   function isOriginallyProtected(wallet,recipient){return expanded?pairs.has(wallet+'|'+recipient):recipient===config.recipient&&wallets.has(wallet);}
-  return {applies,isOriginallyProtected,admit,rollback,observeAck,snapshot,config:{start_ms:config.start_ms,scope_wallets:wallets.size}};
+  return {applies,isOriginallyProtected,admit,rollback,refreshRollback,observeAck,snapshot,config:{start_ms:config.start_ms,scope_wallets:wallets.size}};
 }

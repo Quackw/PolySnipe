@@ -89,3 +89,28 @@ it('a delayed 429 retry cannot be overtaken by the next chunk in that chat',()=>
  expect(repo.listPendingAlerts(500)).toEqual([]);expect(repo.listPendingAlerts(1000).map(r=>r.text)).toEqual(['hello']);
  repo.claimAlert(first.id);repo.finishAlert(first.id,'DELIVERED');expect(repo.listPendingAlerts(1000).map(r=>r.text)).toEqual(['second']);
 });
+
+it('marks a long outbox row UNKNOWN after a partial delivery and never replays an acknowledged chunk',async()=>{
+ vi.useFakeTimers();
+ const {repo,dbPath}=setup();
+ const text='a'.repeat(3900)+'\n'+'b'.repeat(300);
+ repo.markPollSuccess({proxyAddress:'wallet',lastSeenTimestamp:123,lastSeenKeys:['key'],lastPolledAtMs:1,nextPollAtMs:9999999999999,alerts:[{...alert,text}]});
+ const fetch=vi.fn<typeof globalThis.fetch>()
+  .mockResolvedValueOnce(Response.json({ok:true,result:{message_id:1,chat:{id:10}}}))
+  .mockResolvedValueOnce(Response.json({ok:false,error_code:429,parameters:{retry_after:1}},{status:429}));
+ vi.stubGlobal('fetch',fetch);
+ const sender=createTelegramSender({token:'test',timeoutMs:100,log:()=>{}});
+ const scheduler=new PollScheduler(testConfig(dbPath),repo,brokenClient,{sendTelegram:sender,log:()=>{}});
+ scheduler.start();
+ await vi.advanceTimersByTimeAsync(20);
+ await scheduler.stopAndDrain();
+ expect(fetch).toHaveBeenCalledTimes(2);
+ expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)).text).toBe('a'.repeat(3900));
+ expect(JSON.parse(String(fetch.mock.calls[1]?.[1]?.body)).text).toBe('b'.repeat(300));
+ expect(repo.outboxCounts()).toEqual({UNKNOWN:1});
+ scheduler.start();
+ await vi.advanceTimersByTimeAsync(5000);
+ await scheduler.stopAndDrain();
+ expect(fetch).toHaveBeenCalledTimes(2);
+ expect(repo.outboxCounts()).toEqual({UNKNOWN:1});
+});

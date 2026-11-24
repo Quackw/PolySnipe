@@ -3,25 +3,18 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {createRequire} from 'node:module';
-import {createSendOnce} from './send-once.mjs';
+import Database from 'better-sqlite3';
+import {createSendOnce,MAX_TRACKED_ACK_IDS} from './send-once.mjs';
 import {userActionKey,userActionIdentity,eventKey,canonicalTrade} from './identity.mjs';
 import {reconnectBoundary,inReconnectOverlap} from './reconnect-boundary.mjs';
 
-let Database;
-try{Database=(await import('node:sqlite')).DatabaseSync;}
-catch{Database=createRequire(import.meta.url)('better-sqlite3');}
 const wallet=n=>'0x'+n.toString(16).padStart(40,'0');
 const hash=n=>'0x'+n.toString(16).padStart(64,'0');
-function fixture(expanded=false){
+function fixture(expanded=false,{onDisk=false}={}){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'send-once-test-'));
  const wallets=Array.from({length:6},(_,i)=>wallet(i+1));
  fs.writeFileSync(path.join(root,'send-once-canary.json'),JSON.stringify(expanded?{version:2,start_ms:1000,subscriptions:wallets.flatMap(wallet=>[42,43].map(recipient=>({wallet,recipient})))}:{version:1,start_ms:1000,recipient:42,wallets}));
- const db=new Database(':memory:');
- if(!db.transaction)db.transaction=fn=>(...args)=>{
-  db.exec('BEGIN');try{const result=fn(...args);db.exec('COMMIT');return result;}
-  catch(e){db.exec('ROLLBACK');throw e;}
- };
+ const db=new Database(onDisk?path.join(root,'state.db'):':memory:',{timeout:0});
  db.exec(`CREATE TABLE deliveries(event_key TEXT,chat_id INTEGER,wallet TEXT,
    source_timestamp INTEGER,first_seen_at_ms INTEGER,message_html TEXT,
    state TEXT DEFAULT 'PENDING',next_at_ms INTEGER,delivered_at_ms INTEGER,PRIMARY KEY(event_key,chat_id))`);
@@ -156,4 +149,88 @@ test('all frozen subscriptions missing and duplicate configured pairs remain sta
   config.subscriptions.push(config.subscriptions[0]);fs.writeFileSync(file,JSON.stringify(config));
   assert.throws(()=>createSendOnce(f.db,{root:f.root,ownerIds:[42],recipientMap:new Map(),insert:null}),/send_once_scope_missing/);
  }finally{f.close();}
+});
+
+test('a real SQLITE_BUSY writer conflict leaves SEND-ONCE enabled and admission retryable', () => {
+ const f=fixture(false,{onDisk:true});
+ const competing=new Database(f.db.name);
+ try {
+  competing.exec('BEGIN IMMEDIATE');
+  assert.throws(()=>f.admit(f.trade),{code:'SQLITE_BUSY'});
+  assert.equal(f.count(),0);
+  assert.equal(fs.existsSync(path.join(f.root,'SEND_ONCE_ROLLBACK')),false);
+  competing.exec('ROLLBACK');
+  assert.equal(f.admit(f.trade).kind,'SEND_FIRST_ACTION');
+  assert.equal(f.admit(f.trade).kind,'SUPPRESS_SAME_ACTION');
+ } finally {
+  competing.close();
+  f.close();
+ }
+});
+
+test('observes external rollback markers outside the admission transaction', t => {
+ const f=fixture();
+ try {
+  const marker=path.join(f.root,'SEND_ONCE_ROLLBACK');
+  const existsSync=fs.existsSync;
+  t.mock.method(fs,'existsSync',function(file){
+   if(file===marker)assert.equal(f.db.inTransaction,false);
+   return existsSync(file);
+  });
+  fs.writeFileSync(marker,'external stop\n');
+  assert.equal(f.admit(f.trade).kind,'LEGACY_AFTER_ROLLBACK');
+  assert.equal(f.count(),0);
+  fs.unlinkSync(marker);
+  assert.equal(f.admit(f.trade).kind,'SEND_FIRST_ACTION');
+ } finally {
+  f.close();
+ }
+});
+
+test('evicts old diagnostic ACK IDs while the durable action reservation still suppresses them', () => {
+ const f=fixture();
+ try {
+  for(let i=1;i<=MAX_TRACKED_ACK_IDS+10;i++){
+   const trade={...f.trade,hash:hash(i)};
+   assert.equal(f.admit(trade).kind,'SEND_FIRST_ACTION');
+   f.canary.observeAck({wallet:trade.wallet,chat_id:42,event_key:eventKey(trade)},
+     {kind:'OK',value:{result:{message_id:i}}});
+  }
+  assert.equal(f.canary.snapshot().tracked_ack_ids,MAX_TRACKED_ACK_IDS);
+  assert.equal(f.admit(f.trade).kind,'SUPPRESS_SAME_ACTION');
+  assert.equal(f.count(),MAX_TRACKED_ACK_IDS+10);
+  assert.equal(f.canary.snapshot().rollback,false);
+ } finally {
+  f.close();
+ }
+});
+
+test('LRU cache keeps an acknowledgement that was observed again before eviction', () => {
+ const f = fixture();
+ try {
+  function observe(trade, id) {
+   const row = {wallet: trade.wallet, chat_id: 42, event_key: eventKey(trade)};
+   f.canary.observeAck(row, {kind: 'OK', value: {result: {message_id: id}}});
+  }
+  for (let id = 1; id <= MAX_TRACKED_ACK_IDS; id++) {
+   const trade = {...f.trade, hash: hash(id)};
+   assert.equal(f.admit(trade).kind, 'SEND_FIRST_ACTION');
+   observe(trade, id);
+  }
+
+  observe(f.trade, 1);
+  const nextId = MAX_TRACKED_ACK_IDS + 1;
+  const nextTrade = {...f.trade, hash: hash(nextId)};
+  assert.equal(f.admit(nextTrade).kind, 'SEND_FIRST_ACTION');
+  observe(nextTrade, nextId);
+  assert.equal(f.canary.snapshot().tracked_ack_ids, MAX_TRACKED_ACK_IDS);
+  assert.equal(f.canary.snapshot().rollback, false);
+
+  observe(f.trade, nextId + 1);
+  const snapshot = f.canary.snapshot();
+  assert.equal(snapshot.duplicate_telegram_alerts, 1);
+  assert.equal(snapshot.rollback, true);
+ } finally {
+  f.close();
+ }
 });

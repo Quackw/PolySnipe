@@ -1,3 +1,4 @@
+import { pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";
 import { openDb } from "./db/client.js";
 import { AppRepository } from "./db/repository.js";
@@ -9,7 +10,24 @@ import { createAdminNotifier } from "./services/adminNotifier.js";
 import { notifyFatalError } from "./services/runtimeErrors.js";
 import { pollingHealth } from "./services/pollingHealth.js";
 
-async function main(config = loadConfig()): Promise<void> {
+const SHUTDOWN_DEADLINE_MS = 20_000;
+const FATAL_NOTIFY_TIMEOUT_MS = 3_000;
+
+async function notifyWithDeadline(notify: () => Promise<void>): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      new Promise<void>((resolve) => { timeout = setTimeout(resolve, FATAL_NOTIFY_TIMEOUT_MS); }),
+      Promise.resolve().then(notify)
+    ]);
+  } catch {
+    console.error("[fatal] Error notification failed");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function main(config = loadConfig()): Promise<void> {
   const sender = createTelegramSender({
     token: config.telegramBotToken,
     timeoutMs: config.telegramTimeoutMs,
@@ -25,8 +43,16 @@ async function main(config = loadConfig()): Promise<void> {
   });
   const bot = createTelegramBot(config, repo, polymarket, notifier);
 
-  let shutdownPromise: Promise<void> | null = null;
+  let shutdownPromise: Promise<void> | undefined;
+  let shutdownDeadline: ReturnType<typeof setTimeout> | undefined;
   let stopping = false;
+  let fatal = false;
+  const armShutdownDeadline = () => {
+    shutdownDeadline ??= setTimeout(() => {
+      console.error("[fatal] Shutdown deadline exceeded");
+      process.exit(1);
+    }, SHUTDOWN_DEADLINE_MS);
+  };
   const health = pollingHealth(() => {
     console.error("[fatal] Telegram polling stale for 180 seconds; restarting");
     process.exitCode = 1;
@@ -38,86 +64,97 @@ async function main(config = loadConfig()): Promise<void> {
     return result;
   });
   const shutdown = (): Promise<void> => {
-    if (shutdownPromise) {
-      return shutdownPromise;
-    }
-
+    if (shutdownPromise) return shutdownPromise;
     stopping = true;
-    health.stop();
-    scheduler.stop();
-    const deadline = setTimeout(() => {
-      console.error("[fatal] Shutdown deadline exceeded");
+    armShutdownDeadline();
+    shutdownPromise = Promise.resolve().then(async () => {
+      health.stop();
+      const results = await Promise.allSettled([
+        Promise.resolve().then(() => bot.isRunning() ? bot.stop() : undefined),
+        Promise.resolve().then(() => scheduler.stopAndDrain())
+      ]);
+      db.close();
+      if (results.some((result) => result.status === "rejected")) throw new Error("Drain failed");
+      clearTimeout(shutdownDeadline);
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+      process.off("uncaughtException", onUncaughtException);
+      process.off("unhandledRejection", onUnhandledRejection);
+    }).catch(() => {
+      console.error("[fatal] Shutdown failed");
       process.exit(1);
-    }, 20_000);
-    shutdownPromise = (async () => {
-      try {
-        await Promise.all([bot.isRunning() ? bot.stop() : Promise.resolve(), scheduler.stopAndDrain()]);
-        repo.close();
-        clearTimeout(deadline);
-      } catch {
-        console.error("[fatal] Shutdown failed");
-        process.exit(1);
-      }
-    })();
+    });
     return shutdownPromise;
   };
 
-  process.once("SIGINT", () => void shutdown());
-  process.once("SIGTERM", () => void shutdown());
-  process.once("uncaughtException", (error) => {
-    void notifyFatalError(notifier, "uncaughtException", error, (line) => console.log(line)).finally(async () => {
-      console.error(`[fatal] uncaughtException ${(error as Error).message ?? String(error)}`);
-      process.exitCode = 1;
-      await shutdown();
-    });
-  });
-  process.once("unhandledRejection", (reason) => {
-    void notifyFatalError(notifier, "unhandledRejection", reason, (line) => console.log(line)).finally(async () => {
-      console.error(`[fatal] unhandledRejection ${String(reason)}`);
-      process.exitCode = 1;
-      await shutdown();
-    });
-  });
-
-  scheduler.start();
-  await bot.start({
-    timeout: 25,
-    onStart: (info) => {
-      console.log(`[ok] Telegram bot started as @${info.username}`);
-    }
-  });
-  if (!stopping) {
-    console.error("[fatal] Telegram polling exited unexpectedly");
+  function onSignal() {
+    void shutdown();
+  }
+  function onFatal(source: "uncaughtException" | "unhandledRejection", error: unknown) {
+    if (fatal) return;
+    fatal = true;
     process.exitCode = 1;
+    armShutdownDeadline();
+    scheduler.stop();
+    console.error("[fatal] " + source);
+    void notifyWithDeadline(() => notifyFatalError(notifier, source, error, (line) => console.log(line)))
+      .then(shutdown)
+      .finally(() => process.exit(1));
+  }
+  function onUncaughtException(error: Error) {
+    onFatal("uncaughtException", error);
+  }
+  function onUnhandledRejection(reason: unknown) {
+    onFatal("unhandledRejection", reason);
+  }
+
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  process.once("uncaughtException", onUncaughtException);
+  process.once("unhandledRejection", onUnhandledRejection);
+
+  try {
+    scheduler.start();
+    await bot.start({
+      timeout: 25,
+      onStart: (info) => {
+        console.log("[ok] Telegram bot started as @" + info.username);
+      }
+    });
+    if (!stopping) {
+      console.error("[fatal] Telegram polling exited unexpectedly");
+      process.exitCode = 1;
+      await shutdown();
+    }
+  } catch (error) {
     await shutdown();
+    throw error;
   }
 }
 
-const startupConfig = (() => {
+function start(): void {
+  let config: ReturnType<typeof loadConfig>;
   try {
-    return loadConfig();
+    config = loadConfig();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[fatal] ${message}`);
+    console.error("[fatal] " + message);
     process.exitCode = 1;
-    return null;
+    return;
   }
-})();
-
-if (startupConfig) {
-  main(startupConfig).catch((error: unknown) => {
-    // Do not leave scheduler timers running after the Telegram loop fails.
+  main(config).catch((error: unknown) => {
     // Raw transport errors can contain the Telegram token URL.
     console.error("[fatal] Telegram runtime failed; restarting");
     setTimeout(() => process.exit(1), 5_000);
     const sender = createTelegramSender({
-      token: startupConfig.telegramBotToken,
-      timeoutMs: startupConfig.telegramTimeoutMs,
+      token: config.telegramBotToken,
+      timeoutMs: config.telegramTimeoutMs,
       log: (line) => console.log(line)
     });
-    const notifier = createAdminNotifier(startupConfig, sender, (line) => console.log(line));
-    void notifyFatalError(notifier, "startup", error, (line) => console.log(line)).finally(() => {
-      process.exit(1);
-    });
+    const notifier = createAdminNotifier(config, sender, (line) => console.log(line));
+    void notifyWithDeadline(() => notifyFatalError(notifier, "startup", error, (line) => console.log(line)))
+      .finally(() => process.exit(1));
   });
 }
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) start();

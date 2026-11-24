@@ -6,7 +6,7 @@
 2. Copy `.env.example` to `.env`. Set `TELEGRAM_BOT_TOKEN` for your bot and a private `SQLITE_PATH`. Set `ADMIN_TELEGRAM_USER_IDS` only for accounts that should see the admin menu.
 3. Run `pnpm run build` and `pnpm start`. Use a separate bot token and database for a development instance.
 
-V1 stores subscriptions, checkpoints and alert delivery state in SQLite. Preserve the database across normal restarts. Avoid running two pollers against the same bot and state. Polling and request limits can be set in `.env`.
+V1 stores subscriptions, checkpoints and alert delivery state in SQLite. Preserve the database across normal restarts. Avoid running two pollers against the same bot and state. Polling and request limits can be set in `.env`. Blank numeric settings use their defaults. A configured `HTTP_RETRIES` is the fallback for `POLYMARKET_RETRIES`. With neither set, V1 uses two general HTTP retries and one Polymarket retry.
 
 ## FAST and B
 
@@ -17,3 +17,9 @@ A live setup needs a private FAST state directory and subscription database, a p
 B requires `POLYSNIPE_B_ENABLE=1` and an absolute `POLYSNIPE_B_STATE_DIR` owned by its process user with mode `0700`. Its config, frozen scope, pinned hosts and key material are private files in that directory. The forced SSH command relays only to the fixed private FAST socket. Use a restricted account for the bridge.
 
 Treat `UNKNOWN` as unresolved delivery. The B store retains outage events for reconciliation. A full store reports incomplete capture, so check its health and free space during a trial.
+
+## Delivery and shutdown
+
+V1 and FAST give SQLite writers up to five seconds to acquire a lock. FAST still limits the age of its final delivery-state verification to two seconds before starting a request.
+
+If FAST stops or rejects a claim before starting the request, it releases the owned claim back to the queue. Inactive subscriptions are cancelled. Once a request starts, an ambiguous outcome stays in DELIVERY_UNKNOWN. V1 likewise keeps a partially acknowledged multi-chunk alert in UNKNOWN if a later chunk fails. These states do not retry automatically.
