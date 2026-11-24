@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import {createDeliveryClaimGuard} from './delivery-claim.mjs';
+import {createDeliveryClaimGuard,createSubscriptionCancellation} from './delivery-claim.mjs';
 import {createSendOnce} from './send-once.mjs';
 import {recoveryController} from './recovery.mjs';
 import {eventKey,userActionKey} from './identity.mjs';
@@ -24,7 +24,8 @@ function fixture(t,{onDisk=false,version=2}={}) {
     CREATE TABLE subscriptions(proxy_address TEXT,telegram_chat_id INTEGER,subscriber_id INTEGER,notify_from_ts INTEGER);
     CREATE TABLE subscribers(id INTEGER,telegram_user_id INTEGER,telegram_chat_id INTEGER,chat_type TEXT);
     CREATE TABLE tracked_accounts(proxy_address TEXT,name TEXT,pseudonym TEXT,profile_slug TEXT);
-    CREATE TABLE access_grants(telegram_user_id INTEGER);`);
+    CREATE TABLE access_grants(telegram_user_id INTEGER);
+    CREATE TABLE rtds_metadata_audit(event_key TEXT PRIMARY KEY);`);
   db.prepare('INSERT INTO subscriptions VALUES(?,?,?,0)').run(wallet,recipient,1);
   db.prepare("INSERT INTO subscribers VALUES(1,?,?,'private')").run(recipient,recipient);
   db.prepare('INSERT INTO tracked_accounts(proxy_address) VALUES(?)').run(wallet);
@@ -159,4 +160,95 @@ test('a temporary writer lock retries only the settlement before any new network
   } finally {
     competing.close();
   }
+});
+
+for (const caseData of [
+  {messageId: 0, matches: true, state: 'DELIVERY_UNKNOWN', audit: 'DELIVERY_UNKNOWN', reason: 'INVALID_RECOVERY_ACK'},
+  {messageId: 1, matches: false, state: 'DELIVERY_UNKNOWN', audit: 'WRONG_ATTRIBUTION', reason: 'WRONG_ATTRIBUTION'},
+  {messageId: 1, matches: true, state: 'DELIVERED', audit: 'DELIVERED', reason: null}
+]) {
+  test('recovery persists and returns the validated send state: ' + caseData.audit, t => {
+    const f = fixture(t);
+    const {key} = f.seed(1);
+    const row = f.claim(key);
+    assert.equal(f.recovery.beforeSend(row), true);
+    f.recovery.markSendStarted(row);
+    const finalize = f.db.prepare(
+      "UPDATE deliveries SET state=?,claim_token=NULL,possible_duplicate=?,last_error=?,delivered_at_ms=? " +
+      "WHERE event_key=? AND chat_id=? AND state='SENDING' AND claim_token=?"
+    );
+    const result = {
+      kind: 'OK', status: 200, telegram_ok: true,
+      message_id: caseData.messageId, recipient_matches: caseData.matches
+    };
+    const state = f.recovery.onResult(row, result,
+      {state:'DELIVERED', next:0, error:null, possible:0, delivered:4100},
+      decision => finalize.run(decision.state, decision.possible, decision.error, decision.delivered,
+        row.event_key, row.chat_id, row.claimToken).changes === 1);
+    assert.equal(state, caseData.state);
+    assert.equal(f.delivery(key).state, state);
+    assert.equal(f.delivery(key).claim_token, null);
+    assert.equal(f.delivery(key).last_error, caseData.reason);
+    assert.equal(f.delivery(key).possible_duplicate, state === 'DELIVERY_UNKNOWN' ? 1 : 0);
+    assert.equal(f.audit(key).state, caseData.audit);
+    assert.equal(f.audit(key).delivered_at_ms, state === 'DELIVERED' ? 4100 : null);
+    assert.equal(f.recovery.stats().stop_reason, caseData.reason);
+  });
+}
+
+test('recovery observation failures and failed safety-stop writes both surface safe diagnostics', t => {
+  const f = fixture(t);
+  const {trade, key} = f.seed(1);
+  f.db.exec("CREATE TRIGGER fail_observation BEFORE UPDATE ON recovery_canary_audit " +
+    "BEGIN SELECT RAISE(ABORT,'fixture private diagnostic'); END");
+  const log = t.mock.method(console, 'error', () => {});
+  assert.doesNotThrow(() => f.recovery.onDirectAction(trade, 4000));
+  assert.deepEqual(log.mock.calls.map(call => call.arguments[0]), [
+    '[recovery] RECOVERY_OBSERVATION_ERROR', '[recovery] RECOVERY_OBSERVATION_STOP_ERROR'
+  ]);
+  assert.equal(f.recovery.stats().stop_reason, 'RECOVERY_OBSERVATION_ERROR');
+  assert.equal(f.delivery(key).state, 'PENDING');
+});
+
+test('FAST takes the writer lock before selecting the rows to cancel and preserves active sends', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fast-cancel-'));
+  const filename = path.join(root, 'state.db');
+  const db = new Database(filename, {timeout:0});
+  db.pragma('journal_mode = WAL');
+  const competing = new Database(filename, {timeout:0});
+  t.after(() => {
+    competing.close();
+    db.close();
+    fs.rmSync(root, {recursive:true, force:true});
+  });
+  let verifyLock = false;
+  let lockedReads = 0;
+  db.function('probe_writer_lock', {deterministic:true}, () => {
+    if (verifyLock) {
+      assert.equal(db.inTransaction, true);
+      assert.throws(() => competing.exec('UPDATE probe SET touched=1'), {code:'SQLITE_BUSY'});
+      lockedReads++;
+    }
+    return 2;
+  });
+  db.exec("CREATE TABLE probe(touched INTEGER); INSERT INTO probe VALUES(0); " +
+    "CREATE TABLE deliveries(event_key TEXT, wallet TEXT, chat_id INTEGER, state TEXT, " +
+    "next_at_ms INTEGER, last_error TEXT, attempts INTEGER AS (probe_writer_lock()) VIRTUAL)");
+  const insert = db.prepare('INSERT INTO deliveries(event_key,wallet,chat_id,state) VALUES(?,?,?,?)');
+  insert.run('pending',wallet,recipient,'PENDING');
+  insert.run('inflight',wallet,recipient,'SENDING');
+  insert.run('other-chat',wallet,recipient+1,'PENDING');
+
+  const cancel = createSubscriptionCancellation(db);
+  verifyLock = true;
+  const cancelled = cancel(wallet,recipient);
+  verifyLock = false;
+  assert.ok(lockedReads > 0);
+  assert.deepEqual(cancelled,[{event_key:'pending',chat_id:recipient,attempts:2}]);
+  assert.deepEqual(db.prepare('SELECT event_key,state FROM deliveries ORDER BY rowid').all(), [
+    {event_key:'pending',state:'CANCELLED_SUBSCRIPTION'},
+    {event_key:'inflight',state:'SENDING'},
+    {event_key:'other-chat',state:'PENDING'}
+  ]);
+  assert.equal(competing.prepare('SELECT touched FROM probe').pluck().get(), 0);
 });

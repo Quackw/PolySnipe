@@ -12,7 +12,8 @@ import {createHash} from 'node:crypto';
 import { canonicalTrade, eventKey, formatAlert, normalizeAddress } from './identity.mjs';
 import { cacheKeys, findCachedMetadata, lookupGammaMetadata, mergeMetadata, rawMetadata } from './metadata.mjs';
 import { recoveryController } from './recovery.mjs';
-import {createDeliveryClaimGuard} from './delivery-claim.mjs';
+import {createDeliveryClaimGuard,createSubscriptionCancellation} from './delivery-claim.mjs';
+import {configureSqlite} from '../../src/db/sqlite-pragmas.mjs';
 import {createFastShutdown} from './shutdown.mjs';
 import {isRetryableSqliteLock} from './sqlite-lock.mjs';
 import { telegramRequest,deliveryDecision } from './telegram-transport.mjs';
@@ -86,8 +87,7 @@ if (process.argv[2] === 'test-owner1') {
   const db = new Database(DB_PATH);
   const trace=createTrace(ROOT,Database,{policy:'SEND_ONCE_OWNER_SCOPE_RECOVERY_OFF'});
   const boundaryStats={canary:true,overlap_ms:2000,optimality_proven:false,overlap_accepted:0,stale_dropped:0};
-  db.pragma('busy_timeout = 5000');
-  db.pragma('journal_mode = WAL');
+  configureSqlite(db);
   db.exec(`
     CREATE TABLE IF NOT EXISTS cohort (
       wallet TEXT NOT NULL, chat_id INTEGER NOT NULL, notify_from_ts INTEGER NOT NULL,
@@ -130,6 +130,11 @@ if (process.argv[2] === 'test-owner1') {
     AND possible_duplicate=0 AND next_at_ms<=? ORDER BY next_at_ms LIMIT 1`);
   const recoveryDue = db.prepare(`SELECT * FROM deliveries WHERE state='DELIVERY_UNKNOWN'
     AND 0 AND next_at_ms<=? ORDER BY next_at_ms LIMIT 1`);
+  const cancelInactiveClaim=db.prepare(`UPDATE deliveries SET state='CANCELLED_SUBSCRIPTION',
+    next_at_ms=0,last_error='subscription_removed' WHERE event_key=? AND chat_id=?
+    AND state IN ('PENDING','FAILED_RETRYABLE')`);
+  const markClaimed=db.prepare(`UPDATE deliveries SET state='SENDING',claim_token=?,send_started_at_ms=?,attempts=attempts+1,
+    ambiguous_retries=ambiguous_retries+? WHERE event_key=? AND chat_id=?`);
   const claimTransaction = db.transaction((now, allowNew, stateStarted) => {
     const row = (allowNew ? due : recoveryDue).get(now);
     if (!row) return null;
@@ -137,7 +142,7 @@ if (process.argv[2] === 'test-owner1') {
       const allowed=directGate.beforeClaim(row,stateStarted);
       if(!allowed.allow){
         if(allowed.reason==='SUBSCRIPTION_INACTIVE'){
-          const cancelled=db.prepare(`UPDATE deliveries SET state='CANCELLED_SUBSCRIPTION',next_at_ms=0,last_error='subscription_removed' WHERE event_key=? AND chat_id=? AND state IN ('PENDING','FAILED_RETRYABLE')`).run(row.event_key,row.chat_id);
+          const cancelled=cancelInactiveClaim.run(row.event_key,row.chat_id);
           if(cancelled.changes!==1)stopFast('RTDS_CANCEL_CLAIM_CHANGED');
         }else stopFast('RTDS_CLAIM_'+allowed.reason);
         return null;
@@ -146,9 +151,7 @@ if (process.argv[2] === 'test-owner1') {
     const recoveryCheck=recovery.beforeClaim(row);
     if(!recoveryCheck.allow)return null;
     const claimToken = randomUUID();
-    db.prepare(`UPDATE deliveries SET state='SENDING',claim_token=?,send_started_at_ms=?,attempts=attempts+1,
-      ambiguous_retries=ambiguous_retries+? WHERE event_key=? AND chat_id=?`)
-      .run(claimToken, now, row.state === 'DELIVERY_UNKNOWN' ? 1 : 0, row.event_key, row.chat_id);
+    markClaimed.run(claimToken, now, row.state === 'DELIVERY_UNKNOWN' ? 1 : 0, row.event_key, row.chat_id);
     return { ...row, claimToken, sendStartedAtMs:now, recovery: row.state === 'DELIVERY_UNKNOWN',isRestRecovery:recoveryCheck.isRest };
   });
   const claim=(now,allowNew)=>{
@@ -226,14 +229,7 @@ if (process.argv[2] === 'test-owner1') {
     LEFT JOIN access_grants g ON g.telegram_user_id=u.telegram_user_id
     WHERE u.chat_type='private' AND u.telegram_chat_id=u.telegram_user_id
       AND (g.telegram_user_id IS NOT NULL OR u.telegram_user_id IN (${ownerPlaceholders})))`);
-  const recovery=recoveryController(db,{root:ROOT,ownerIds,enabledDirect:()=>recoveryEnabled&&!!enabledAt(),getSendOnce:()=>sendOnce,traceRecovery:(stage,value,chat,key,raw)=>{
-    if(stage==='begin'){const id=trace.begin(value,'REST_RECOVERY','TRADE',JSON.stringify(value));trace.stage(id,'REST_RECOVERY_ACCEPTED',{source:'REST_RECOVERY'});return id;}
-    trace.queue(value,key,chat,projection(raw,'REST_RECOVERY','TRADE'),true);
-  }});
-  if (recoveryEnabled) recovery.listen();
-  const cancelPending = db.prepare(`UPDATE deliveries SET state='CANCELLED_SUBSCRIPTION',next_at_ms=0,
-    last_error='subscription_removed' WHERE wallet=? AND chat_id=?
-    AND state IN ('PENDING','FAILED_RETRYABLE','DELIVERY_UNKNOWN')`);
+  const cancelSubscriptionDeliveries=createSubscriptionCancellation(db);
   const resilientMode=process.env.FAST_RTDS_RESILIENT==='1';
   let guardCurrentScope=null;
   function refreshRecipients() {
@@ -250,9 +246,7 @@ if (process.argv[2] === 'test-owner1') {
     for (const [wallet, recipients] of recipientMap) {
       const current = new Set(next.get(wallet)?.map(row => row.chat_id) || []);
       for (const row of recipients) if (!current.has(row.chat_id)) {
-        let traceCancelled=[];
-        try{traceCancelled=db.prepare("SELECT event_key,chat_id,attempts FROM deliveries WHERE wallet=? AND chat_id=? AND state IN ('PENDING','FAILED_RETRYABLE','DELIVERY_UNKNOWN')").all(wallet,row.chat_id);}catch{trace.stage(null,'TRACE_ERROR',{reason:'TRACE_CANCEL_READ_FAILED'});}
-        cancelPending.run(wallet,row.chat_id);
+        const traceCancelled=cancelSubscriptionDeliveries(wallet,row.chat_id);
         for(const cancelled of traceCancelled)trace.delivery(cancelled,'CANCELLED_SUBSCRIPTION',{reason:'SUBSCRIPTION_REMOVED',attempt:cancelled.attempts,final_delivery_state:'CANCELLED_SUBSCRIPTION'});
       }
     }
@@ -267,6 +261,11 @@ if (process.argv[2] === 'test-owner1') {
   refreshRecipients();
   if (!resilientMode && (cohortSubscriptions < 7 || watched.size < 7)) throw Error('initial_subscriptions_missing');
   const sendOnce=createSendOnce(db,{root:ROOT,ownerIds,recipientMap,insert,dynamicProtected:resilientMode});
+  const recovery=recoveryController(db,{root:ROOT,ownerIds,enabledDirect:()=>recoveryEnabled&&!!enabledAt(),getSendOnce:()=>sendOnce,traceRecovery:(stage,value,chat,key,raw)=>{
+    if(stage==='begin'){const id=trace.begin(value,'REST_RECOVERY','TRADE',JSON.stringify(value));trace.stage(id,'REST_RECOVERY_ACCEPTED',{source:'REST_RECOVERY'});return id;}
+    trace.queue(value,key,chat,projection(raw,'REST_RECOVERY','TRADE'),true);
+  }});
+  if (recoveryEnabled) recovery.listen();
   // Review-only candidate. Default OFF; deployment requires separate approval.
   const bRequested=resilientMode&&process.env.FAST_RTDS_B_ENABLED==='1';
   const bDisabled=path.join(ROOT,'RTDS_B_DISABLED');
@@ -567,32 +566,48 @@ if (process.argv[2] === 'test-owner1') {
     sending = true;
     try {
       await claimGuard.run(row,beforeTelegramRequest,requestTelegram,(result,settled)=>{
-        const transportHealth=telegramCircuit.observe(result);
-        if(result.kind==='AMBIGUOUS')console.error('[telegram_circuit] '+JSON.stringify(transportHealth));
-        const now = Date.now();
-        const {state,next,error,possible,delivered}=deliveryDecision(result,row,now);
-        if (result.kind === 'OK') { stats.delivered++; }
-        else if (result.kind === 'AMBIGUOUS') {
+        const now=Date.now();
+        const messageId=result.value?.result?.message_id??null;
+        const recipientMatches=result.kind==='OK'?String(result.value?.result?.chat?.id)===String(row.chat_id):null;
+        const receipt={kind:result.kind,status:result.status,message_id:messageId,
+          telegram_ok:result.value?.ok===true,recipient_matches:recipientMatches};
+        const decision=deliveryDecision(result,row,now);
+        let updated=false;
+        let reason=result.reason??null;
+        const state=recovery.onResult(row,receipt,decision,outcome=>{
+          if(outcome.state!==decision.state)reason=outcome.error;
+          updated=finish.run(outcome.state,result.status,outcome.error,outcome.next,outcome.possible,
+            outcome.delivered,row.event_key,row.chat_id,row.claimToken).changes===1;
+          if(updated)settled();
+          return updated;
+        });
+        if(!updated)reason='DELIVERY_CLAIM_LOST';
+        const kind=state==='DELIVERY_UNKNOWN'?'AMBIGUOUS':result.kind;
+        const transportHealth=telegramCircuit.observe({...result,kind,reason});
+        if(kind==='AMBIGUOUS')console.error('[telegram_circuit] '+JSON.stringify(transportHealth));
+        if(state==='DELIVERED'){
+          stats.delivered++;
+          sendOnce.observeAck(row,result);
+        }else if(state==='DELIVERY_UNKNOWN'){
           stats.deliveryUnknown++;
-          if(!row.isRestRecovery) {
+          if(!row.isRestRecovery){
             ambiguousAt.push(now);
-            while (ambiguousAt[0] < now-3600000) ambiguousAt.shift();
+            while(ambiguousAt[0]<now-3600000)ambiguousAt.shift();
             // UNKNOWN is terminal; pause only consecutive transport failures, keep intake active.
           }
-        } else if(state==='FAILED_FINAL'){stats.confirmedTelegramFailures++;}
-        const updated=finish.run(state,result.status,error,next,possible,delivered,row.event_key,row.chat_id,row.claimToken);
-        if (updated.changes === 1) {
-          settled();
-          sendOnce.observeAck(row,result);
-        }
-        trace.delivery(row,result.kind==='OK'?'TELEGRAM_ACK':result.kind==='AMBIGUOUS'?'DELIVERY_UNKNOWN':'SEND_ERROR',{http_status:result.status,telegram_ok:result.value?.ok??null,message_id:result.value?.result?.message_id??null,recipient_matches:result.kind==='OK'?String(result.value.result.chat?.id)===String(row.chat_id):null,reason:result.reason??null,error_code:result.error_code??null,final_delivery_state:state,delivery_row_updated:updated.changes===1,finished_ms:now});
+        }else if(state==='FAILED_FINAL'){stats.confirmedTelegramFailures++;}
+        trace.delivery(row,state==='DELIVERED'?'TELEGRAM_ACK':state==='DELIVERY_UNKNOWN'?'DELIVERY_UNKNOWN':'SEND_ERROR',
+          {http_status:result.status,telegram_ok:result.value?.ok??null,message_id:messageId,recipient_matches:recipientMatches,
+            reason,error_code:result.error_code??null,final_delivery_state:state,delivery_row_updated:updated,finished_ms:now});
         const tag=x=>createHmac('sha256',ACK_SALT).update(String(x)).digest('hex');
-        fs.appendFileSync(ACK_FILE,JSON.stringify({run_id:ACK_RUN_ID,at_ms:now,event:tag(row.event_key),recipient:tag(row.chat_id),attempt:row.attempts+1,state,kind:result.kind,http_status:result.status,error_code:result.error_code??null,reason:result.reason??null,retry_after_ms:result.retry_after_ms??null,ack_ok:result.value?.ok===true,message_id_present:Number.isSafeInteger(result.value?.result?.message_id),receipt:result.kind==='OK'?tag(row.chat_id+'|'+result.value.result.message_id):null,recipient_matches:result.kind==='OK'?String(result.value.result.chat?.id)===String(row.chat_id):null,source:row.isRestRecovery?'REST_RECOVERY':'FAST_DIRECT',first_seen_ms:row.first_seen_at_ms,source_timestamp:row.source_timestamp,send_started_ms:row.sendStartedAtMs,latency_ms:Math.max(0,now-row.source_timestamp*1000)})+'\n',{mode:0o600});
-        if(row.isRestRecovery) recovery.afterSend(row,{kind:result.kind,status:result.status,
-          message_id:result.value?.result?.message_id??null,telegram_ok:result.value?.ok===true,delivery_row_updated:updated.changes===1,
-          recipient_matches:result.kind==='OK'?String(result.value?.result?.chat?.id)===String(row.chat_id):null},state,delivered);
-        if (result.kind === 'OK') console.log(`[telegram] success_at=${new Date(now).toISOString()} end_to_end_ms=${Math.max(0,now-row.source_timestamp*1000)} duplicate_suppressed=${stats.duplicates}`);
-        if (result.kind !== 'OK') console.error(`[telegram] state=${state} status=${result.status ?? 'unknown'} reason=${result.reason??'UNCLASSIFIED'}`);
+        fs.appendFileSync(ACK_FILE,JSON.stringify({run_id:ACK_RUN_ID,at_ms:now,event:tag(row.event_key),recipient:tag(row.chat_id),
+          attempt:row.attempts+1,state,kind,http_status:result.status,error_code:result.error_code??null,reason,
+          retry_after_ms:result.retry_after_ms??null,ack_ok:receipt.telegram_ok,message_id_present:Number.isSafeInteger(messageId),
+          receipt:state==='DELIVERED'?tag(row.chat_id+'|'+messageId):null,recipient_matches:recipientMatches,
+          source:row.isRestRecovery?'REST_RECOVERY':'FAST_DIRECT',first_seen_ms:row.first_seen_at_ms,source_timestamp:row.source_timestamp,
+          send_started_ms:row.sendStartedAtMs,latency_ms:Math.max(0,now-row.source_timestamp*1000)})+'\n',{mode:0o600});
+        if(state==='DELIVERED')console.log(`[telegram] success_at=${new Date(now).toISOString()} end_to_end_ms=${Math.max(0,now-row.source_timestamp*1000)} duplicate_suppressed=${stats.duplicates}`);
+        else console.error(`[telegram] state=${state} status=${result.status??'unknown'} reason=${reason??'UNCLASSIFIED'}`);
       });
     } catch(e) {
       trace.delivery(row,'SEND_EXCEPTION',{reason:'SEND_WORKER_EXCEPTION'});

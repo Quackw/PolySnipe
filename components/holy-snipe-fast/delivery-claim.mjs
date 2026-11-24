@@ -55,3 +55,16 @@ export function createDeliveryClaimGuard(db, {onClaimLost, now=Date.now}) {
 
   return {run, flush};
 }
+
+// The trace receives exactly the rows cancelled under the writer lock.
+export function createSubscriptionCancellation(db) {
+  const pending = "wallet=? AND chat_id=? AND state IN ('PENDING','FAILED_RETRYABLE','DELIVERY_UNKNOWN')";
+  const read = db.prepare("SELECT event_key,chat_id,attempts FROM deliveries WHERE " + pending);
+  const cancel = db.prepare("UPDATE deliveries SET state='CANCELLED_SUBSCRIPTION',next_at_ms=0," +
+    "last_error='subscription_removed' WHERE " + pending);
+  return db.transaction((wallet, chatId) => {
+    const rows = read.all(wallet, chatId);
+    cancel.run(wallet, chatId);
+    return rows;
+  }).immediate;
+}

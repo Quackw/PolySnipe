@@ -28,6 +28,8 @@ export function ensureSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_alert_outbox_pending ON alert_outbox(status,next_attempt_ms);
     CREATE INDEX IF NOT EXISTS idx_alert_outbox_chat ON alert_outbox(chat_id,status,id);
+    -- Historical outbox rows survive an unsubscribe, so index the reference without a foreign key.
+    CREATE INDEX IF NOT EXISTS idx_alert_outbox_subscription ON alert_outbox(subscription_id,status);
     CREATE TABLE IF NOT EXISTS subscribers (
       id                INTEGER PRIMARY KEY AUTOINCREMENT,
       telegram_user_id  INTEGER NOT NULL,

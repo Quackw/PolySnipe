@@ -338,14 +338,22 @@ export class PollScheduler {
           const sendStartedAtMs = Date.now();
           try {
             await this.deps.sendTelegram(row.chat_id,row.text);
-            this.repo.finishAlert(row.id,'DELIVERED');
+            if (!this.repo.finishAlert(row.id,'DELIVERED')) {
+              this.deps.log(`[outbox:finish_conflict] outbox=${row.id}`);
+              continue;
+            }
           } catch (error) {
             const rejected = error instanceof TelegramRejectedError;
             const retry = rejected && error.code === 429;
-            this.repo.finishAlert(row.id,retry ? 'PENDING' : rejected ? 'REJECTED' : 'UNKNOWN',
+            const status = retry ? 'PENDING' : rejected ? 'REJECTED' : 'UNKNOWN';
+            const updated = this.repo.finishAlert(row.id,status,
               error instanceof Error ? error.message : String(error),
               retry ? Date.now() + Math.max(1000,error.retryAfterMs) : 0);
-            this.deps.log(`[alert:error] proxy=${row.proxy_address} chat=${row.chat_id} outbox=${row.id} status=${retry ? 'PENDING' : rejected ? 'REJECTED' : 'UNKNOWN'}`);
+            if (updated) {
+              this.deps.log(`[alert:error] proxy=${row.proxy_address} chat=${row.chat_id} outbox=${row.id} outcome=${retry ? 'RATE_LIMIT' : status}`);
+            } else {
+              this.deps.log(`[outbox:finish_conflict] outbox=${row.id}`);
+            }
             continue;
           }
           const sendCompletedAtMs = Date.now();

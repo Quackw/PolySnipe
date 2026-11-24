@@ -1,7 +1,7 @@
 import {afterEach,describe,it,expect,vi} from 'vitest';
 import {createTempRepo,testConfig} from './helpers.js';
 import {openDb} from '../src/db/client.js';
-import {AppRepository} from '../src/db/repository.js';
+import {AppRepository,MAX_ALERT_ATTEMPTS} from '../src/db/repository.js';
 import {PollScheduler} from '../src/scheduler.js';
 import {createTelegramSender,TelegramRejectedError} from '../src/apis/telegram.js';
 import type {PolymarketClient} from '../src/apis/polymarket.js';
@@ -113,4 +113,120 @@ it('marks a long outbox row UNKNOWN after a partial delivery and never replays a
  await scheduler.stopAndDrain();
  expect(fetch).toHaveBeenCalledTimes(2);
  expect(repo.outboxCounts()).toEqual({UNKNOWN:1});
+});
+
+it('cancels a subscription’s pending alerts immediately and preserves its active send', () => {
+ const {repo}=setup();
+ admit(repo);
+ admit(repo);
+ const first=repo.listPendingAlerts(100)[0]!;
+ expect(repo.claimAlert(first.id)).toBe(true);
+
+ expect(repo.removeSubscription(10,'wallet').removedSubscriptions).toBe(1);
+ expect(repo.outboxCounts()).toEqual({CANCELLED:1,SENDING:1});
+ expect(repo.finishAlert(first.id,'DELIVERED')).toBe(true);
+ expect(repo.outboxCounts()).toEqual({CANCELLED:1,DELIVERED:1});
+});
+
+it('cancels all pending subscriptions for the requested chat in the same operation', () => {
+ const {repo}=setup();
+ repo.upsertTrackedAccount({proxyAddress:'other-wallet',nextPollAtMs:0});
+ const owner=repo.upsertSubscriber(1,10,'private');
+ const other=repo.upsertSubscriber(2,20,'private');
+ repo.createSubscription(owner,10,'other-wallet',1,0);
+ repo.createSubscription(other,20,'other-wallet',2,0);
+ admit(repo);
+ repo.markPollSuccess({
+  proxyAddress:'other-wallet',lastSeenTimestamp:123,lastSeenKeys:[],lastPolledAtMs:1,nextPollAtMs:1000,
+  alerts:[alert,{...alert,chatId:20}]
+ });
+
+ expect(repo.removeAllSubscriptions(10)).toEqual({removedSubscriptions:2,removedTrackedAccounts:1});
+ expect(repo.outboxCounts()).toEqual({CANCELLED:2,PENDING:1});
+ expect(repo.listPendingAlerts(100).map(row=>row.chat_id)).toEqual([20]);
+});
+
+it('rolls back outbox cancellation if removing the subscription fails', () => {
+ const {repo,dbPath}=setup();
+ admit(repo);
+ const db=openDb(dbPath);
+ try {
+  db.exec("CREATE TRIGGER fail_removal BEFORE DELETE ON subscriptions BEGIN SELECT RAISE(ABORT,'removal failed'); END");
+  expect(()=>repo.removeSubscription(10,'wallet')).toThrow('removal failed');
+  expect(repo.listChatSubscriptions(10)).toHaveLength(1);
+  expect(repo.outboxCounts()).toEqual({PENDING:1});
+ } finally {
+  db.close();
+ }
+});
+
+it('preserves per-chat FIFO during backoff and dispatches a different chat', () => {
+ const {repo}=setup();
+ const other=repo.upsertSubscriber(2,20,'private');
+ repo.createSubscription(other,20,'wallet',2,0);
+ repo.markPollSuccess({
+  proxyAddress:'wallet',lastSeenTimestamp:123,lastSeenKeys:[],lastPolledAtMs:1,nextPollAtMs:1000,
+  alerts:[alert,{...alert,text:'second'},{...alert,chatId:20,text:'other chat'}]
+ });
+ const first=repo.listPendingAlerts(100)[0]!;
+ expect(repo.claimAlert(first.id)).toBe(true);
+ expect(repo.listPendingAlerts(100).map(row=>row.text)).toEqual(['other chat']);
+ expect(repo.finishAlert(first.id,'PENDING','429',1000)).toBe(true);
+ expect(repo.listPendingAlerts(999).map(row=>row.text)).toEqual(['other chat']);
+ expect(repo.listPendingAlerts(1000).map(row=>row.text)).toEqual(['hello','other chat']);
+});
+
+it('does not finalize an alert that recovery already marked UNKNOWN', () => {
+ const {repo}=setup();
+ admit(repo);
+ const {id}=repo.listPendingAlerts(100)[0]!;
+ expect(repo.claimAlert(id)).toBe(true);
+ expect(repo.recoverOutbox()).toBe(1);
+ expect(repo.finishAlert(id,'DELIVERED')).toBe(false);
+ expect(repo.finishAlert(id,'PENDING','429',1000)).toBe(false);
+ expect(repo.outboxCounts()).toEqual({UNKNOWN:1});
+});
+
+it('puts the final retryable send in REJECTED and unblocks the next alert', () => {
+ const {repo,dbPath}=setup();
+ admit(repo);
+ admit(repo);
+ const {id}=repo.listPendingAlerts(100)[0]!;
+ for(let attempt=1;attempt<=MAX_ALERT_ATTEMPTS;attempt++){
+  expect(repo.listPendingAlerts(attempt*100)[0]?.id).toBe(id);
+  expect(repo.claimAlert(id)).toBe(true);
+  expect(repo.finishAlert(id,'PENDING','429',(attempt+1)*100)).toBe(true);
+ }
+ expect(repo.outboxCounts()).toEqual({PENDING:1,REJECTED:1});
+ expect(repo.claimAlert(id)).toBe(false);
+ expect(repo.listPendingAlerts(2000)[0]?.id).not.toBe(id);
+ const db=openDb(dbPath);
+ try {
+  expect(db.prepare('SELECT attempts,next_attempt_ms,last_error FROM alert_outbox WHERE id=?').get(id)).toEqual({
+   attempts:MAX_ALERT_ATTEMPTS,next_attempt_ms:0,last_error:'Delivery attempt limit reached'
+  });
+ } finally {
+  db.close();
+ }
+});
+
+it('adds the subscription index to a populated database and handles an already exhausted pending row', () => {
+ const {repo,dbPath}=setup();
+ admit(repo);
+ const {id}=repo.listPendingAlerts(100)[0]!;
+ const db=openDb(dbPath);
+ db.exec('DROP INDEX idx_alert_outbox_subscription');
+ db.prepare('UPDATE alert_outbox SET attempts=? WHERE id=?').run(MAX_ALERT_ATTEMPTS,id);
+ const reopened=new AppRepository(db);
+ try {
+  expect(db.pragma('index_info(idx_alert_outbox_subscription)')).toMatchObject([{name:'subscription_id'},{name:'status'}]);
+  expect(db.prepare('SELECT text,attempts FROM alert_outbox WHERE id=?').get(id)).toEqual({
+   text:'hello',attempts:MAX_ALERT_ATTEMPTS
+  });
+  expect(reopened.claimAlert(id)).toBe(false);
+  expect(reopened.listPendingAlerts(100)).toEqual([]);
+  expect(reopened.outboxCounts()).toEqual({REJECTED:1});
+ } finally {
+  reopened.close();
+ }
 });

@@ -19,6 +19,9 @@ import type {
   TrackedAccountRecord
 } from "../types.js";
 
+export const MAX_ALERT_ATTEMPTS = 10;
+const ATTEMPTS_EXHAUSTED = "Delivery attempt limit reached";
+
 export type OutboxInsert = { chatId: number; text: string; contextJson: string };
 export type OutboxRow = { id: number; chat_id: number; proxy_address: string; text: string; context_json: string; attempts: number };
 
@@ -169,8 +172,30 @@ function findDelayBucketLabel(delayMs: number): DelayBucketLabel {
 }
 
 export class AppRepository {
+  private readonly listReadyAlerts: (nowMs: number, limit: number) => OutboxRow[];
+
   public constructor(private readonly db: Database.Database) {
     ensureSchema(this.db);
+    const cancelOrphans = this.db.prepare(`UPDATE alert_outbox
+      SET status='CANCELLED', next_attempt_ms=0, last_error='Subscription removed',
+        updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE status='PENDING' AND NOT EXISTS
+        (SELECT 1 FROM subscriptions WHERE id=alert_outbox.subscription_id)`);
+    const rejectExhausted = this.db.prepare(`UPDATE alert_outbox
+      SET status='REJECTED', next_attempt_ms=0, last_error=?,
+        updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE status='PENDING' AND attempts>=?`);
+    // Strict FIFO within each chat preserves the order of separately queued message chunks.
+    const ready = this.db.prepare(`SELECT * FROM alert_outbox AS candidate
+      WHERE status='PENDING' AND next_attempt_ms<=?
+      AND NOT EXISTS (SELECT 1 FROM alert_outbox AS earlier WHERE earlier.chat_id=candidate.chat_id
+        AND earlier.id<candidate.id AND earlier.status IN ('PENDING','SENDING'))
+      ORDER BY id LIMIT ?`);
+    this.listReadyAlerts = this.db.transaction((nowMs: number, limit: number) => {
+      cancelOrphans.run();
+      rejectExhausted.run(ATTEMPTS_EXHAUSTED, MAX_ALERT_ATTEMPTS);
+      return ready.all(nowMs, limit) as OutboxRow[];
+    }).immediate;
   }
 
   public close(): void {
@@ -680,6 +705,7 @@ export class AppRepository {
 
   public removeSubscription(chatId: number, proxyAddress: string): { removedSubscriptions: number; removedTrackedAccounts: number } {
     const tx = this.db.transaction((safeChatId: number, safeProxyAddress: string) => {
+      this.cancelPendingSubscriptions(safeChatId, safeProxyAddress);
       const removedSubscriptions = this.db
         .prepare(
           `
@@ -708,6 +734,7 @@ export class AppRepository {
         )
         .all(safeChatId) as Array<{ proxy_address: string }>;
 
+      this.cancelPendingSubscriptions(safeChatId);
       const removedSubscriptions = this.db
         .prepare(
           `
@@ -726,6 +753,15 @@ export class AppRepository {
     });
 
     return tx.immediate(chatId);
+  }
+
+  private cancelPendingSubscriptions(chatId: number, proxyAddress: string | null = null): void {
+    this.db.prepare(`UPDATE alert_outbox
+      SET status='CANCELLED', next_attempt_ms=0, last_error='Subscription removed',
+        updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE status='PENDING' AND subscription_id IN (
+        SELECT id FROM subscriptions WHERE telegram_chat_id=? AND (? IS NULL OR proxy_address=?)
+      )`).run(chatId, proxyAddress, proxyAddress);
   }
 
   public cleanupTrackedAccountIfOrphaned(proxyAddress: string): number {
@@ -879,24 +915,25 @@ export class AppRepository {
   }
 
   public listPendingAlerts(nowMs: number, limit = 100): OutboxRow[] {
-    this.db.prepare(`UPDATE alert_outbox SET status='CANCELLED' WHERE status='PENDING'
-      AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE id=alert_outbox.subscription_id)`).run();
-    return this.db.prepare(`SELECT * FROM alert_outbox AS candidate WHERE status='PENDING' AND next_attempt_ms<=?
-      AND NOT EXISTS (SELECT 1 FROM alert_outbox AS earlier WHERE earlier.chat_id=candidate.chat_id
-        AND earlier.id<candidate.id AND earlier.status IN ('PENDING','SENDING'))
-      ORDER BY id LIMIT ?`).all(nowMs,limit) as OutboxRow[];
+    return this.listReadyAlerts(nowMs, limit);
   }
 
   public claimAlert(id: number): boolean {
     return this.db.prepare(`UPDATE alert_outbox SET status='SENDING',attempts=attempts+1
-      WHERE id=? AND status='PENDING' AND EXISTS
-      (SELECT 1 FROM subscriptions WHERE id=alert_outbox.subscription_id)`).run(id).changes === 1;
+      WHERE id=? AND status='PENDING' AND attempts<? AND EXISTS
+      (SELECT 1 FROM subscriptions WHERE id=alert_outbox.subscription_id)`).run(id, MAX_ALERT_ATTEMPTS).changes === 1;
   }
 
-  public finishAlert(id: number, status: 'DELIVERED'|'UNKNOWN'|'REJECTED'|'PENDING', error: string|null = null, nextAttemptMs = 0): void {
-    this.db.prepare(`UPDATE alert_outbox SET status=?,last_error=?,next_attempt_ms=?,
-      updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status='SENDING'`)
-      .run(status,error,nextAttemptMs,id);
+  public finishAlert(id: number, status: 'DELIVERED'|'UNKNOWN'|'REJECTED'|'PENDING', error: string|null = null, nextAttemptMs = 0): boolean {
+    const result = this.db.prepare(`UPDATE alert_outbox SET
+      status=CASE WHEN @status='PENDING' AND attempts>=@maxAttempts THEN 'REJECTED' ELSE @status END,
+      last_error=CASE WHEN @status='PENDING' AND attempts>=@maxAttempts THEN @exhausted ELSE @error END,
+      next_attempt_ms=CASE WHEN @status='PENDING' AND attempts<@maxAttempts THEN @nextAttemptMs ELSE 0 END,
+      updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id=@id AND status='SENDING'`).run({
+        id, status, error, nextAttemptMs, maxAttempts: MAX_ALERT_ATTEMPTS, exhausted: ATTEMPTS_EXHAUSTED
+      });
+    return result.changes === 1;
   }
 
   public outboxCounts(): Record<string, number> {
