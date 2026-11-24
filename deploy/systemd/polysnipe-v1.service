@@ -1,0 +1,18 @@
+[Unit]
+Description=PolySnipe V1 polling bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=POLYSNIPE_USER
+WorkingDirectory=/path/to/PolySnipe
+EnvironmentFile=/etc/polysnipe/v1.env
+ExecStart=/usr/bin/node dist/src/index.js
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=25
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -18,8 +18,18 @@ B requires `POLYSNIPE_B_ENABLE=1` and an absolute `POLYSNIPE_B_STATE_DIR` owned 
 
 Treat `UNKNOWN` as unresolved delivery. The B store retains outage events for reconciliation. A full store reports incomplete capture, so check its health and free space during a trial.
 
+## Systemd
+
+Install dependencies with `pnpm install --frozen-lockfile` at the chosen Git revision. Run `pnpm run build` on the V1 host. Use the [templates](../deploy/systemd/) for the services that belong on each host. B can run on its own host and uses its private SSH bridge to FAST.
+
+1. Copy the selected templates. Replace `POLYSNIPE_USER` and `/path/to/PolySnipe`. Set the absolute Node.js 22.13+ path in `ExecStart` if Node is installed elsewhere.
+2. Supply each unit's `EnvironmentFile` with the corresponding variables described above. Keep these files private. Provision each service's state directory and preserve its database and bridge state across restarts.
+3. Verify the rendered units with `systemd-analyze verify`. Install them into `/etc/systemd/system/`, run `systemctl daemon-reload` and then enable and start the selected units. Check service status and logs with `systemctl status` and `journalctl -u`. The units give each service 25 seconds to shut down.
+
 ## Delivery and shutdown
 
 V1 and FAST give SQLite writers up to five seconds to acquire a lock. FAST still limits the age of its final delivery-state verification to two seconds before starting a request.
 
-If FAST stops or rejects a claim before starting the request, it releases the owned claim back to the queue. Inactive subscriptions are cancelled. Once a request starts, an ambiguous outcome stays in DELIVERY_UNKNOWN. V1 likewise keeps a partially acknowledged multi-chunk alert in UNKNOWN if a later chunk fails. These states do not retry automatically.
+If FAST stops or rejects a claim before starting the request, it releases the owned claim back to the queue. Inactive subscriptions are cancelled. A bad recovery acknowledgement is stored as `DELIVERY_UNKNOWN` in the delivery queue. V1 likewise keeps a partially acknowledged multi-chunk alert in `UNKNOWN` if a later chunk fails. These states stay out of automatic retries.
+
+V1 cancels pending outbox rows in the same transaction that removes their subscription. Existing send attempts can finish, and their results stay in the outbox history. Dispatch preserves FIFO within each chat during backoff. A retryable rejection on the tenth attempt puts the row in `REJECTED` and lets the next queued alert proceed.

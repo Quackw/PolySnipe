@@ -1,0 +1,18 @@
+[Unit]
+Description=PolySnipe independent RTDS B receiver
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=POLYSNIPE_USER
+WorkingDirectory=/path/to/PolySnipe
+EnvironmentFile=/etc/polysnipe/b-receiver.env
+ExecStart=/usr/bin/node components/snipe-b-receiver/ops/snipe-v3-combined/server62-entry.mjs
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=25
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
