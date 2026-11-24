@@ -1,0 +1,59 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!!**/node_modules",
+      "!!**/dist",
+      "!!**/coverage",
+      "!!**/artifacts",
+      "!!**/state",
+      "!!**/runtime",
+      "!!**/fixtures",
+      "!!components/snipe-v2-runtime"
+    ]
+  },
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 110
+  },
+  "linter": {
+    "rules": {
+      "recommended": false,
+      "correctness": {
+        "noConstAssign": "error",
+        "noUnreachable": "error"
+      },
+      "suspicious": {
+        "noDebugger": "error",
+        "noDuplicateObjectKeys": "error",
+        "noDuplicateParameters": "error"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "trailingCommas": "none"
+    }
+  },
+  "assist": {
+    "enabled": false
+  },
+  "overrides": [
+    {
+      "includes": ["components/**/*.mjs"],
+      "javascript": {
+        "formatter": {
+          "quoteStyle": "single"
+        }
+      }
+    }
+  ]
+}
