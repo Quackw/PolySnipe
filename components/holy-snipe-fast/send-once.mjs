@@ -93,6 +93,8 @@ export function createSendOnce(db,{root,ownerIds,recipientMap,insert,now=Date.no
     if(!Number.isSafeInteger(id)||id<=0)return;
     if(ackIds.has(key)&&ackIds.get(key)!==id){stats.duplicate_telegram_alerts++;rollback('DUPLICATE_TELEGRAM_ALERT');}
     else {
+      // Refresh the recency of repeated acknowledgements before eviction.
+      ackIds.delete(key);
       ackIds.set(key,id);
       if (ackIds.size > MAX_TRACKED_ACK_IDS) ackIds.delete(ackIds.keys().next().value);
     }

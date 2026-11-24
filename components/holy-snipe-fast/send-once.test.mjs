@@ -204,3 +204,33 @@ test('evicts old diagnostic ACK IDs while the durable action reservation still s
   f.close();
  }
 });
+
+test('LRU cache keeps an acknowledgement that was observed again before eviction', () => {
+ const f = fixture();
+ try {
+  function observe(trade, id) {
+   const row = {wallet: trade.wallet, chat_id: 42, event_key: eventKey(trade)};
+   f.canary.observeAck(row, {kind: 'OK', value: {result: {message_id: id}}});
+  }
+  for (let id = 1; id <= MAX_TRACKED_ACK_IDS; id++) {
+   const trade = {...f.trade, hash: hash(id)};
+   assert.equal(f.admit(trade).kind, 'SEND_FIRST_ACTION');
+   observe(trade, id);
+  }
+
+  observe(f.trade, 1);
+  const nextId = MAX_TRACKED_ACK_IDS + 1;
+  const nextTrade = {...f.trade, hash: hash(nextId)};
+  assert.equal(f.admit(nextTrade).kind, 'SEND_FIRST_ACTION');
+  observe(nextTrade, nextId);
+  assert.equal(f.canary.snapshot().tracked_ack_ids, MAX_TRACKED_ACK_IDS);
+  assert.equal(f.canary.snapshot().rollback, false);
+
+  observe(f.trade, nextId + 1);
+  const snapshot = f.canary.snapshot();
+  assert.equal(snapshot.duplicate_telegram_alerts, 1);
+  assert.equal(snapshot.rollback, true);
+ } finally {
+  f.close();
+ }
+});
