@@ -11,23 +11,37 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-type HttpError = Error & {
+const MAX_RETRY_AFTER_MS = 60_000;
+const MAX_BACKOFF_MS = 30_000;
+
+type HttpError = {
   statusCode?: number;
   retryAfterMs?: number;
 };
 
+class HttpStatusError extends Error {
+  constructor(
+    readonly statusCode: number,
+    url: string,
+    readonly retryAfterMs: number | undefined
+  ) {
+    super(`HTTP ${statusCode} for ${url}`);
+  }
+}
+
 export function parseRetryAfterMs(value: string | null, nowMs = Date.now()): number | undefined {
-  if (!value) {
+  const header = value?.trim();
+  if (!header) {
     return undefined;
   }
 
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) {
-    return Math.ceil(seconds * 1000);
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) {
+    return seconds < 0 ? undefined : Math.min(MAX_RETRY_AFTER_MS, Math.ceil(seconds * 1000));
   }
 
-  const dateMs = Date.parse(value);
-  return Number.isFinite(dateMs) ? Math.max(0, dateMs - nowMs) : undefined;
+  const dateMs = Date.parse(header);
+  return Number.isFinite(dateMs) ? Math.min(MAX_RETRY_AFTER_MS, Math.max(0, dateMs - nowMs)) : undefined;
 }
 
 export function calculateHttpRetryDelayMs(
@@ -35,33 +49,45 @@ export function calculateHttpRetryDelayMs(
   attempt: number,
   randomValue = Math.random()
 ): number {
-  const httpError = error as HttpError;
-  if (httpError?.statusCode === 429) {
-    const exponentialMs = Math.min(30_000, 1000 * 2 ** Math.max(0, attempt - 1));
-    const jitterMs = Math.floor(Math.max(0, Math.min(1, randomValue)) * 250);
-    return Math.max(exponentialMs, httpError.retryAfterMs ?? 0) + jitterMs;
+  const httpError = error as HttpError | null | undefined;
+  const baseMs = httpError?.statusCode === 429 ? 1000 : 200;
+  const exponentialMs = baseMs * 2 ** Math.max(0, attempt - 1);
+  const jitterMs = Math.floor(Math.max(0, Math.min(1, randomValue)) * 250);
+  const backoffMs = Math.min(MAX_BACKOFF_MS, exponentialMs + jitterMs);
+  return Math.max(backoffMs, Math.min(MAX_RETRY_AFTER_MS, httpError?.retryAfterMs ?? 0));
+}
+
+function isRetryable(error: unknown): boolean {
+  if (error instanceof HttpStatusError) {
+    const { statusCode } = error;
+    return statusCode === 408 || statusCode === 429 || (statusCode >= 500 && statusCode < 600);
   }
 
-  return 200 * attempt;
+  // Fetch and body-stream network failures reject with TypeError. JSON parsing
+  // can fail transiently too, such as when an intermediary serves an HTML page.
+  return (
+    error instanceof TypeError ||
+    error instanceof SyntaxError ||
+    (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"))
+  );
 }
 
-export async function getJson<T>(url: string, options: RequestOptions): Promise<T> {
-  const text = await getText(url, options);
-  return JSON.parse(text) as T;
+export function getJson<T>(url: string, options: RequestOptions): Promise<T> {
+  return get(url, options, (body) => JSON.parse(body) as T);
 }
 
-export async function getText(url: string, options: RequestOptions): Promise<string> {
-  let lastError: unknown;
+export function getText(url: string, options: RequestOptions): Promise<string> {
+  return get(url, options, (body) => body);
+}
 
-  for (let attempt = 0; attempt <= options.retries; attempt += 1) {
-    let ticketRelease = await options.beforeAttempt?.();
-    const release = (): void => {
-      const fn = ticketRelease;
-      ticketRelease = undefined;
-      fn?.();
-    };
+async function get<T>(url: string, options: RequestOptions, parse: (body: string) => T): Promise<T> {
+  const maxRetries = Number.isFinite(options.retries) ? Math.max(0, Math.floor(options.retries)) : 0;
+
+  for (let attempt = 0; ; attempt += 1) {
+    const release = await options.beforeAttempt?.();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
+    let retry: { error: unknown; delayMs: number };
 
     try {
       const response = await fetch(url, {
@@ -74,36 +100,34 @@ export async function getText(url: string, options: RequestOptions): Promise<str
       });
 
       if (!response.ok) {
-        const body = await response.text();
-        const error = new Error(`HTTP ${response.status} for ${url}: ${body.slice(0, 300)}`) as HttpError;
-        error.statusCode = response.status;
-        const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
-        if (retryAfterMs !== undefined) {
-          error.retryAfterMs = retryAfterMs;
-        }
+        // Classify from headers even if the error response body is stalled or truncated.
+        void response.body?.cancel().catch(() => undefined);
+        throw new HttpStatusError(
+          response.status,
+          url,
+          parseRetryAfterMs(response.headers.get("retry-after"))
+        );
+      }
+
+      return parse(await response.text());
+    } catch (error) {
+      if (!isRetryable(error)) {
         throw error;
       }
-
-      return await response.text();
-    } catch (error) {
-      lastError = error;
-      clearTimeout(timeout);
-      release();
-      const retryAttempt = attempt + 1;
-      const retryDelayMs = calculateHttpRetryDelayMs(error, retryAttempt);
-      if ((error as HttpError)?.statusCode === 429) {
-        options.onRateLimit?.(retryDelayMs);
+      const delayMs = calculateHttpRetryDelayMs(error, attempt + 1);
+      if (error instanceof HttpStatusError && error.statusCode === 429) {
+        // Protect other clients of this gate even when this request has no retries left.
+        options.onRateLimit?.(delayMs);
       }
-      if (attempt >= options.retries) {
-        break;
+      if (attempt >= maxRetries) {
+        throw error;
       }
-      options.onRetry?.(url, retryAttempt, error, retryDelayMs);
-      await delay(retryDelayMs);
+      retry = { error, delayMs };
     } finally {
       clearTimeout(timeout);
-      release();
+      release?.();
     }
+    options.onRetry?.(url, attempt + 1, retry.error, retry.delayMs);
+    await delay(retry.delayMs);
   }
-
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }

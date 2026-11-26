@@ -8,6 +8,8 @@
 
 V1 stores subscriptions, checkpoints and alert delivery state in SQLite. Preserve the database across normal restarts. Avoid running two pollers against the same bot and state. Polling and request limits can be set in `.env`. Blank numeric settings use their defaults. A configured `HTTP_RETRIES` is the fallback for `POLYMARKET_RETRIES`. With neither set, V1 uses two general HTTP retries and one Polymarket retry.
 
+Polymarket GETs retry network failures, timeouts, HTTP 408, 429 and 5xx, and malformed JSON. Each attempt acquires its own rate-limit slot. A 429 pauses the shared gate even when that request has exhausted its retry budget. Local backoff is capped at 30 seconds. A valid HTTP `Retry-After` can extend that to 60 seconds.
+
 ## FAST and B
 
 Use `pnpm run test:components` to exercise the receive workers, shared sender and bridge with temporary data. It makes no requests to Telegram or Polymarket.
@@ -31,5 +33,7 @@ Install dependencies with `pnpm install --frozen-lockfile` at the chosen Git rev
 V1 and FAST give SQLite writers up to five seconds to acquire a lock. FAST still limits the age of its final delivery-state verification to two seconds before starting a request.
 
 If FAST stops or rejects a claim before starting the request, it releases the owned claim back to the queue. Inactive subscriptions are cancelled. A bad recovery acknowledgement is stored as `DELIVERY_UNKNOWN` in the delivery queue. V1 likewise keeps a partially acknowledged multi-chunk alert in `UNKNOWN` if a later chunk fails. These states stay out of automatic retries.
+
+FAST pauses queued Telegram sends immediately on a 429 or after three consecutive transient failures. The calculated cooldown ranges from 5 to 60 seconds. Telegram's `retry_after` can direct a longer pause. On expiry one normal queued send probes the transport and still goes through the final delivery-state check.
 
 V1 cancels pending outbox rows in the same transaction that removes their subscription. Existing send attempts can finish, and their results stay in the outbox history. Dispatch preserves FIFO within each chat during backoff. A retryable rejection on the tenth attempt puts the row in `REJECTED` and lets the next queued alert proceed.
