@@ -227,5 +227,8 @@ export interface AlertDelaySampleInsert {
 }
 
 export interface RuntimeNotifierDeps {
-  notifyError: (source: "startup" | "uncaughtException" | "unhandledRejection" | "bot handler", error: unknown) => Promise<void>;
+  notifyError: (
+    source: "startup" | "uncaughtException" | "unhandledRejection" | "bot handler",
+    error: unknown
+  ) => Promise<void>;
 }

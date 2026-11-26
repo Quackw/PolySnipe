@@ -15,12 +15,14 @@ import { openBCaptureStore } from './b-capture-store.mjs';
 
 const BASE = 1800000000000;
 const scope = Array.from({ length: 14 }, (_, n) => ({
-  wallet: '0x' + (n + 1).toString(16).padStart(40, '0'), recipient: 1, notify_from_ts: BASE / 1000
+  wallet: '0x' + (n + 1).toString(16).padStart(40, '0'),
+  recipient: 1,
+  notify_from_ts: BASE / 1000
 }));
 const fingerprint = scopeFingerprint(scope);
 const runId = 'b-channel-recovery-copy';
-const temp = prefix => fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), prefix));
-const pause = () => new Promise(resolve => setTimeout(resolve, 10));
+const temp = (prefix) => fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), prefix));
+const pause = () => new Promise((resolve) => setTimeout(resolve, 10));
 async function until(read, expected) {
   for (let i = 0; i < 200; i++) {
     if (read() === expected) return;
@@ -29,14 +31,25 @@ async function until(read, expected) {
   assert.equal(read(), expected);
 }
 const envelope = (n, at, wallet = scope[0].wallet) => ({
-  topic: 'activity', type: 'trades',
-  payload: { proxyWallet: wallet, transactionHash: '0x' + n.toString(16).padStart(64, '0'),
-    asset: 'fixture', side: 'BUY', size: 1, price: .5, timestamp: Math.floor(at / 1000) }
+  topic: 'activity',
+  type: 'trades',
+  payload: {
+    proxyWallet: wallet,
+    transactionHash: '0x' + n.toString(16).padStart(64, '0'),
+    asset: 'fixture',
+    side: 'BUY',
+    size: 1,
+    price: 0.5,
+    timestamp: Math.floor(at / 1000)
+  }
 });
 function captureRows(directory) {
   const db = new DatabaseSync(path.join(directory, 'channel-capture.sqlite'), { readOnly: true });
-  try { return db.prepare('SELECT state, reason, envelope_json FROM capture_events ORDER BY id').all(); }
-  finally { db.close(); }
+  try {
+    return db.prepare('SELECT state, reason, envelope_json FROM capture_events ORDER BY id').all();
+  } finally {
+    db.close();
+  }
 }
 
 // Child stdio -> real Unix socket and authenticated bridge; only the external
@@ -54,28 +67,68 @@ sys.exit(bridge.run())
 `;
 
 test('separate child channel loss preserves B, an unconfirmed ACK and offline events on a copied FAST queue', async () => {
-  const seedDir = temp('fast-dual-local-seed-'), copyDir = temp('fast-dual-local-copy-'), bDir = temp('b-cap-');
+  const seedDir = temp('fast-dual-local-seed-'),
+    copyDir = temp('fast-dual-local-copy-'),
+    bDir = temp('b-cap-');
   const bridgeDir = fs.mkdtempSync('/tmp/b-link-');
   const key = randomBytes(32);
   const file = 'local-fast-dual.sqlite';
-  const makeStore = () => openBCaptureStore({ directory: bDir, runId, scopeFingerprint: fingerprint, minFreeBytes: 0 });
-  let m = 0, gateExpired = false, monoReads = 0, ownerReason, status = {}, server, source, capture, owner, seed, options;
-  let sockets = 0, closes = 0, attempts = 0, intercepted = false, cutAck = false, child, relay;
-  const children = new Set(), results = [], mode = { scope: true };
-  const ownerConfig = { scope, startMs: BASE, now: () => BASE + m,
-    mono: () => gateExpired && monoReads++ > 0 ? m + 2001 : m };
-  const packet = n => envelope(n, BASE + m);
-  const tick = (elapsed = 0) => { m += elapsed; source.tick(); };
-  const fire = e => options.onActivity(e, { received_mono_ms: m, received_wall_ms: BASE + m, generation: 1 });
+  const makeStore = () =>
+    openBCaptureStore({ directory: bDir, runId, scopeFingerprint: fingerprint, minFreeBytes: 0 });
+  let m = 0,
+    gateExpired = false,
+    monoReads = 0,
+    ownerReason,
+    status = {},
+    server,
+    source,
+    capture,
+    owner,
+    seed,
+    options;
+  let sockets = 0,
+    closes = 0,
+    attempts = 0,
+    intercepted = false,
+    cutAck = false,
+    child,
+    relay;
+  const children = new Set(),
+    results = [],
+    mode = { scope: true };
+  const ownerConfig = {
+    scope,
+    startMs: BASE,
+    now: () => BASE + m,
+    mono: () => (gateExpired && monoReads++ > 0 ? m + 2001 : m)
+  };
+  const packet = (n) => envelope(n, BASE + m);
+  const tick = (elapsed = 0) => {
+    m += elapsed;
+    source.tick();
+  };
+  const fire = (e) =>
+    options.onActivity(e, { received_mono_ms: m, received_wall_ms: BASE + m, generation: 1 });
   const startBridge = async () => {
-    server = startFastBridge({ directory: bridgeDir, keyPath: path.join(bridgeDir, 'bridge.key'),
-      runId, scopeFingerprint: fingerprint, onState: s => { status.channel = s; },
+    server = startFastBridge({
+      directory: bridgeDir,
+      keyPath: path.join(bridgeDir, 'bridge.key'),
+      runId,
+      scopeFingerprint: fingerprint,
+      onState: (s) => {
+        status.channel = s;
+      },
       getWallets: mode.scope ? () => [scope[0].wallet] : null,
       owner: {
-        ...owner, submit(frame) {
+        ...owner,
+        submit(frame) {
           const result = owner.submit(frame);
           ownerReason = result.reason;
-          if (cutAck) { cutAck = false; intercepted = true; server.close(); }
+          if (cutAck) {
+            cutAck = false;
+            intercepted = true;
+            server.close();
+          }
           return result;
         }
       }
@@ -85,27 +138,52 @@ test('separate child channel loss preserves B, an unconfirmed ACK and offline ev
   try {
     seed = createLocalFastIngress({ ...ownerConfig, directory: seedDir });
     const initial = seed.openSource('A');
-    assert.equal(seed.submit({ ...initial, sequence: 1, message_id: 'seed', envelope: packet(1) }).status, 'ACCEPTED');
-    assert.equal(seed.finishSimulation(seed.claimForSimulation(), { outcome: 'AMBIGUOUS' }).status, 'AMBIGUOUS');
-    seed.close(); seed = null;
+    assert.equal(
+      seed.submit({ ...initial, sequence: 1, message_id: 'seed', envelope: packet(1) }).status,
+      'ACCEPTED'
+    );
+    assert.equal(
+      seed.finishSimulation(seed.claimForSimulation(), { outcome: 'AMBIGUOUS' }).status,
+      'AMBIGUOUS'
+    );
+    seed.close();
+    seed = null;
     fs.copyFileSync(path.join(seedDir, file), path.join(copyDir, file));
     const seedBytes = fs.readFileSync(path.join(seedDir, file));
     owner = createLocalFastIngress({ ...ownerConfig, directory: copyDir, reopen: true });
     const a = owner.openSource('A');
     let seq = 0;
-    const addA = e => owner.submit({ ...a, sequence: ++seq, message_id: 'A-' + seq, envelope: e });
+    const addA = (e) => owner.submit({ ...a, sequence: ++seq, message_id: 'A-' + seq, envelope: e });
 
-    for (const name of ['identity', 'known_hosts']) fs.writeFileSync(path.join(bDir, name), 'fixture', { mode: 0o600 });
+    for (const name of ['identity', 'known_hosts'])
+      fs.writeFileSync(path.join(bDir, name), 'fixture', { mode: 0o600 });
     fs.writeFileSync(path.join(bridgeDir, 'bridge.key'), key, { mode: 0o600 });
     capture = makeStore();
-    const ssh = prepareBSSH({ host: 'fixture.invalid', user: 'fixture', runId, scopeFingerprint: fingerprint,
-      key, wallets: scope.map(p => p.wallet), identityFile: path.join(bDir, 'identity'), knownHostsFile: path.join(bDir, 'known_hosts'),
+    const ssh = prepareBSSH({
+      host: 'fixture.invalid',
+      user: 'fixture',
+      runId,
+      scopeFingerprint: fingerprint,
+      key,
+      wallets: scope.map((p) => p.wallet),
+      identityFile: path.join(bDir, 'identity'),
+      knownHostsFile: path.join(bDir, 'known_hosts'),
       spawn(exe, args, spawnOptions) {
         assert.equal(exe, '/usr/bin/ssh');
         assert.ok(args.includes('StrictHostKeyChecking=yes'));
         assert.equal(children.size, 0, 'only one child may be running');
         attempts++;
-        child = spawn('python3', ['-IB', '-c', childProgram, path.resolve('components/snipe-v3-combined/bridge-stdio.py'), bridgeDir], spawnOptions);
+        child = spawn(
+          'python3',
+          [
+            '-IB',
+            '-c',
+            childProgram,
+            path.resolve('components/snipe-v3-combined/bridge-stdio.py'),
+            bridgeDir
+          ],
+          spawnOptions
+        );
         children.add(child);
         child.once('exit', () => children.delete(child));
         return child;
@@ -113,14 +191,37 @@ test('separate child channel loss preserves B, an unconfirmed ACK and offline ev
     });
     key.fill(0); // Entrypoint clears its source key as well.
     class Peer {
-      constructor(o) { options = o; sockets++; }
-      start() { options.onOpen(); }
+      constructor(o) {
+        options = o;
+        sockets++;
+      }
+      start() {
+        options.onOpen();
+      }
       tick() {}
-      stop() { closes++; }
-      health() { return { phase: 'OPEN', generation: 1 }; }
+      stop() {
+        closes++;
+      }
+      health() {
+        return { phase: 'OPEN', generation: 1 };
+      }
     }
-    source = createRemoteB({ scope, ssh: { start(args) { relay = ssh.start(args); return relay; }, close: ssh.close }, capture, mono: () => m, wall: () => BASE + m,
-      Peer, socketFactory: () => assert.fail('external socket'), onDiagnostic: row => results.push(row) });
+    source = createRemoteB({
+      scope,
+      ssh: {
+        start(args) {
+          relay = ssh.start(args);
+          return relay;
+        },
+        close: ssh.close
+      },
+      capture,
+      mono: () => m,
+      wall: () => BASE + m,
+      Peer,
+      socketFactory: () => assert.fail('external socket'),
+      onDiagnostic: (row) => results.push(row)
+    });
 
     // Startup without FAST must not prevent capture. It must also survive two
     // subsequent authenticated sessions, one of which lacks a scope snapshot.
@@ -143,8 +244,12 @@ test('separate child channel loss preserves B, an unconfirmed ACK and offline ev
     mode.scope = true;
     await startBridge();
     tick(500);
-    await until(() => ['READY','CLOSED'].includes(source.status().channel), true);
-    assert.equal(source.status().channel, 'READY', JSON.stringify({channel:relay.status(),attempts,m,status}));
+    await until(() => ['READY', 'CLOSED'].includes(source.status().channel), true);
+    assert.equal(
+      source.status().channel,
+      'READY',
+      JSON.stringify({ channel: relay.status(), attempts, m, status })
+    );
     assert.equal(owner.summary().queue_rows, 1, 'offline rows were never replayed');
 
     cutAck = true;
@@ -158,8 +263,12 @@ test('separate child channel loss preserves B, an unconfirmed ACK and offline ev
     assert.equal(addA(packet(6)).status, 'ACCEPTED');
     await startBridge();
     tick(250);
-    await until(() => ['READY','CLOSED'].includes(source.status().channel), true);
-    assert.equal(source.status().channel, 'READY', JSON.stringify({channel:relay.status(),attempts,m,status}));
+    await until(() => ['READY', 'CLOSED'].includes(source.status().channel), true);
+    assert.equal(
+      source.status().channel,
+      'READY',
+      JSON.stringify({ channel: relay.status(), attempts, m, status })
+    );
     assert.equal(attempts, 4);
     assert.equal(sockets, 1);
     assert.equal(closes, 0);
@@ -176,7 +285,7 @@ test('separate child channel loss preserves B, an unconfirmed ACK and offline ev
     assert.equal(owner.summary().delivery_states.DELIVERY_UNKNOWN, 1);
     assert.equal(owner.summary().action_recipient_reservations, 4);
     assert.deepEqual(capture.snapshot().counts, { ACK_UNCERTAIN: 1, CAPTURED_ONLY: 3, OWNER_ATTENTION: 1 });
-    assert.equal(results.filter(x => x.kind === 'B_FORWARD_REQUESTED').length, 4);
+    assert.equal(results.filter((x) => x.kind === 'B_FORWARD_REQUESTED').length, 4);
 
     gateExpired = true;
     fire(packet(9));
@@ -191,10 +300,13 @@ test('separate child channel loss preserves B, an unconfirmed ACK and offline ev
     capture = makeStore();
     assert.deepEqual(capture.snapshot().counts, { ACK_UNCERTAIN: 2, CAPTURED_ONLY: 3, OWNER_ATTENTION: 1 });
   } finally {
-    source?.stop(); server?.close();
+    source?.stop();
+    server?.close();
     for (const p of children) p.kill('SIGKILL');
     await until(() => children.size, 0);
-    capture?.close(); owner?.close(); seed?.close();
+    capture?.close();
+    owner?.close();
+    seed?.close();
     for (const dir of [seedDir, copyDir, bDir, bridgeDir]) fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -205,7 +317,14 @@ test('bounded capture reports unavailable storage and keeps prior rows and pendi
   let capture, source, options;
   try {
     capture = openBCaptureStore(config);
-    const evidence = { received_wall_ms: BASE, scope_version: 0, connection_id: null, generation: 1, frame_seq: 1, action_key: 'fixture' };
+    const evidence = {
+      received_wall_ms: BASE,
+      scope_version: 0,
+      connection_id: null,
+      generation: 1,
+      frame_seq: 1,
+      action_key: 'fixture'
+    };
     const e = envelope(2, BASE);
     capture.save(e, evidence, true, null);
     assert.equal(fs.statSync(path.join(directory, 'channel-capture.sqlite')).mode & 0o777, 0o600);
@@ -214,26 +333,49 @@ test('bounded capture reports unavailable storage and keeps prior rows and pendi
     assert.equal(capture.snapshot().interrupted, 1);
     const diagnostics = [];
     class Peer {
-      constructor(o) { options = o; }
-      start() { options.onOpen(); }
+      constructor(o) {
+        options = o;
+      }
+      start() {
+        options.onOpen();
+      }
       stop() {}
-      health() { return { phase: 'OPEN' }; }
+      health() {
+        return { phase: 'OPEN' };
+      }
     }
-    source = createRemoteB({ scope, ssh: { start() { throw Error('FIXTURE_LINK_DOWN'); } }, capture,
-      socketFactory: () => assert.fail('external socket'), Peer, mono: () => 0, wall: () => BASE,
-      onDiagnostic: row => diagnostics.push(row) });
+    source = createRemoteB({
+      scope,
+      ssh: {
+        start() {
+          throw Error('FIXTURE_LINK_DOWN');
+        }
+      },
+      capture,
+      socketFactory: () => assert.fail('external socket'),
+      Peer,
+      mono: () => 0,
+      wall: () => BASE,
+      onDiagnostic: (row) => diagnostics.push(row)
+    });
     await source.start();
     options.onActivity(envelope(3, BASE));
     assert.equal(source.status().peer.phase, 'OPEN');
     assert.equal(source.status().capture.failures, 1);
-    assert.ok(diagnostics.some(x => x.kind === 'B_CAPTURE_RESULT' && x.state === 'CAPTURE_INCOMPLETE' && x.reason === 'B_CAPTURE_FULL'));
+    assert.ok(
+      diagnostics.some(
+        (x) =>
+          x.kind === 'B_CAPTURE_RESULT' && x.state === 'CAPTURE_INCOMPLETE' && x.reason === 'B_CAPTURE_FULL'
+      )
+    );
     const rows = captureRows(directory);
     assert.equal(rows.length, 1);
     assert.equal(rows[0].state, 'ACK_UNCERTAIN');
     assert.equal(rows[0].reason, 'B_PROCESS_INTERRUPTED');
     assert.deepEqual(JSON.parse(rows[0].envelope_json), e);
   } finally {
-    source?.stop(); capture?.close();
+    source?.stop();
+    capture?.close();
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });

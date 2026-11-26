@@ -11,7 +11,10 @@ PolySnipe monitors Polymarket wallets and sends activity alerts to Telegram. V1 
 | [V1 polling bot](src/) | Manages chat subscriptions and queues alerts in SQLite as it advances each wallet's checkpoint. |
 | [V3 FAST](components/holy-snipe-fast/) | Processes RTDS trades and sends alerts through a shared queue with per-recipient deduplication. |
 | [B receiver](components/snipe-b-receiver/) | Adds a second RTDS input and captures eligible events during a FAST bridge outage for reconciliation. |
-| [V2 menu runtime](components/snipe-v2-runtime/) | Provides the Telegram menu and subscription handling used by FAST. |
+| [V2 menu runtime](components/snipe-v2-runtime/) | Compatibility code that provides the Telegram menu and subscription handling used by FAST. |
+| [RTDS receivers and gates](components/snipe-rtds-resilient/) | FAST runtime support for buffered input, reconnects and fresh delivery checks. |
+| [FAST bridge](components/snipe-v3-combined/) | FAST runtime support for the authenticated B channel and shared queue. |
+| [Readiness](components/snipe-v3-readiness/) and [passive diagnostics](components/snipe-rtds-passive-ab/) | Eligibility and bridge helpers, plus tools for validating the RTDS inputs. |
 
 ## Test locally
 
@@ -21,6 +24,7 @@ Use Node.js 22.13 or newer, pnpm 10.32.1, Python 3 and OpenSSL. The test suite u
 git clone https://github.com/Quackw/PolySnipe.git
 cd PolySnipe
 pnpm install --frozen-lockfile
+pnpm run lint
 pnpm run test:all
 ```
 
@@ -32,9 +36,13 @@ pnpm run test:all
 
 See the [operating guide](docs/operation.md) for configuration and the requirements for running FAST and B.
 
+## Run under systemd
+
+The [unit templates](deploy/systemd/) cover V1, FAST and the independent B receiver. Install the pinned dependencies, build V1, and fill in the service user, checkout path and private environment file for each selected unit. Follow the [systemd setup](docs/operation.md#systemd) to verify the units and install them on the intended hosts.
+
 ## Delivery behavior
 
-- V1 stores a wallet's new checkpoint and queued alerts together in SQLite.
+- V1 stores the checkpoint and queued alerts together. Unsubscribing cancels pending alerts in the same operation. Alerts keep their order within each chat, with at most ten delivery attempts per row.
 - FAST reserves each action per recipient before sending, so matching A and B events share one delivery record. The final delivery-state check has a two-second freshness limit.
 - Ambiguous Telegram sends remain `UNKNOWN` in V1 or `DELIVERY_UNKNOWN` in FAST for review. Both senders keep those alerts out of automatic retries.
 - B checks the current subscription scope before resuming live forwarding after reconnect. Events captured during the outage remain available for reconciliation.

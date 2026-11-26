@@ -1,3 +1,4 @@
+# Runtime components share the root package and lockfile.
 allowBuilds:
   better-sqlite3: true
   esbuild: true

@@ -1,15 +1,115 @@
-import test from 'node:test';import assert from 'node:assert/strict';
-import {telegramRequest,deliveryDecision} from './telegram-transport.mjs';
-const request=fetchImpl=>telegramRequest('TEST_ONLY','sendMessage',{chat_id:'123',text:'fixture'},{fetchImpl});
-const response=(status,value)=>async()=>({status,json:async()=>value,body:{cancel:async()=>{}}});
-test('ordinary direct send validates acknowledgement without recovery flag',async()=>{const r=await request(response(200,{ok:true,result:{message_id:7,chat:{id:123}}}));assert.equal(r.kind,'OK');assert.equal(r.value.result.message_id,7);});
-test('HTTP 200 alone cannot mark a message delivered',async()=>{for(const value of [null,{}, {ok:false,description:'private text'}]){const r=await request(response(200,value));assert.equal(r.kind,'AMBIGUOUS');assert.equal(r.reason,'API_ACK_NOT_CONFIRMED');assert.ok(!JSON.stringify(r).includes('private text'));}});
-test('missing, zero, fractional or string receipt cannot establish success',async()=>{for(const id of [undefined,0,1.5,'7'])assert.equal((await request(response(200,{ok:true,result:{message_id:id}}))).reason,'RECEIPT_INVALID');});
-test('JSON failure is sanitized and ambiguous',async()=>{const r=await request(async()=>({status:200,json:async()=>{throw Error('private body');}}));assert.deepEqual(r,{kind:'AMBIGUOUS',status:200,reason:'RESPONSE_INVALID_JSON'});});
-test('network failures preserve only bounded safe codes',async()=>{for(const [error,reason] of [[Object.assign(Error('secret token'),{cause:{code:'ECONNRESET'}}),'ECONNRESET'],[Object.assign(Error('secret'),{name:'TimeoutError'}),'TRANSPORT_TIMEOUT'],[Object.assign(Error('secret'),{code:'private arbitrary'}),'TRANSPORT_ERROR']])assert.deepEqual(await request(async()=>{throw error;}),{kind:'AMBIGUOUS',status:null,reason});});
-test('HTTP retry classification and single request remain unchanged',async()=>{for(const status of [408,429,500,503,400,403]){let calls=0;const r=await request(async(...a)=>{calls++;return response(status,null)(...a);});assert.equal(calls,1);assert.equal(r.kind,[408,429,500,503].includes(status)?'RETRYABLE':'FINAL');}});
-test('getMe remains supported without a Message receipt',async()=>{assert.equal((await telegramRequest('TEST','getMe',{}, {fetchImpl:response(200,{ok:true,result:{username:'fixture'}})})).kind,'OK');});
-test('same timeout, body and POST; no extra transport retries',async()=>{let calls=0;await request(async(url,opts)=>{calls++;assert.equal(opts.method,'POST');assert.deepEqual(JSON.parse(opts.body),{chat_id:'123',text:'fixture'});assert.ok(opts.signal);return response(200,{ok:true,result:{message_id:1}})();});assert.equal(calls,1);});
-test('explicit ok=false is classified by API error_code even with HTTP200',async()=>{for(const code of [400,403,429,500]){const r=await request(response(200,{ok:false,error_code:code,description:'private'}));assert.equal(r.kind,code>=500||code===429?'RETRYABLE':'FINAL');assert.equal(r.error_code,code);assert.ok(!JSON.stringify(r).includes('private'));}});
-test('429 retry_after is a lower bound and retries remain bounded',async()=>{const r=await request(response(429,{ok:false,error_code:429,parameters:{retry_after:90}}));assert.equal(r.retry_after_ms,90000);assert.equal(deliveryDecision(r,{attempts:0,possible_duplicate:0},100).next,90100);assert.equal(deliveryDecision(r,{attempts:2,possible_duplicate:0},100).state,'FAILED_FINAL');});
-test('5xx has at most three attempts; ambiguous is never automatically replayed',()=>{assert.equal(deliveryDecision({kind:'RETRYABLE',reason:'HTTP_503'},{attempts:1},100).state,'FAILED_RETRYABLE');assert.equal(deliveryDecision({kind:'RETRYABLE',reason:'HTTP_503'},{attempts:2},100).state,'FAILED_FINAL');assert.deepEqual(deliveryDecision({kind:'AMBIGUOUS',reason:'TRANSPORT_TIMEOUT'},{attempts:0},100),{state:'DELIVERY_UNKNOWN',next:0,error:'TRANSPORT_TIMEOUT',possible:1,delivered:null});});
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { telegramRequest, deliveryDecision } from './telegram-transport.mjs';
+const request = (fetchImpl) =>
+  telegramRequest('TEST_ONLY', 'sendMessage', { chat_id: '123', text: 'fixture' }, { fetchImpl });
+const response = (status, value) => async () => ({
+  status,
+  json: async () => value,
+  body: { cancel: async () => {} }
+});
+test('ordinary direct send validates acknowledgement without recovery flag', async () => {
+  const r = await request(response(200, { ok: true, result: { message_id: 7, chat: { id: 123 } } }));
+  assert.equal(r.kind, 'OK');
+  assert.equal(r.value.result.message_id, 7);
+});
+test('HTTP 200 alone cannot mark a message delivered', async () => {
+  for (const value of [null, {}, { ok: false, description: 'private text' }]) {
+    const r = await request(response(200, value));
+    assert.equal(r.kind, 'AMBIGUOUS');
+    assert.equal(r.reason, 'API_ACK_NOT_CONFIRMED');
+    assert.ok(!JSON.stringify(r).includes('private text'));
+  }
+});
+test('missing, zero, fractional or string receipt cannot establish success', async () => {
+  for (const id of [undefined, 0, 1.5, '7'])
+    assert.equal(
+      (await request(response(200, { ok: true, result: { message_id: id } }))).reason,
+      'RECEIPT_INVALID'
+    );
+});
+test('JSON failure is sanitized and ambiguous', async () => {
+  const r = await request(async () => ({
+    status: 200,
+    json: async () => {
+      throw Error('private body');
+    }
+  }));
+  assert.deepEqual(r, { kind: 'AMBIGUOUS', status: 200, reason: 'RESPONSE_INVALID_JSON' });
+});
+test('network failures preserve only bounded safe codes', async () => {
+  for (const [error, reason] of [
+    [Object.assign(Error('secret token'), { cause: { code: 'ECONNRESET' } }), 'ECONNRESET'],
+    [Object.assign(Error('secret'), { name: 'TimeoutError' }), 'TRANSPORT_TIMEOUT'],
+    [Object.assign(Error('secret'), { code: 'private arbitrary' }), 'TRANSPORT_ERROR']
+  ])
+    assert.deepEqual(
+      await request(async () => {
+        throw error;
+      }),
+      { kind: 'AMBIGUOUS', status: null, reason }
+    );
+});
+test('HTTP retry classification and single request remain unchanged', async () => {
+  for (const status of [408, 429, 500, 503, 400, 403]) {
+    let calls = 0;
+    const r = await request(async (...a) => {
+      calls++;
+      return response(status, null)(...a);
+    });
+    assert.equal(calls, 1);
+    assert.equal(r.kind, [408, 429, 500, 503].includes(status) ? 'RETRYABLE' : 'FINAL');
+  }
+});
+test('getMe remains supported without a Message receipt', async () => {
+  assert.equal(
+    (
+      await telegramRequest(
+        'TEST',
+        'getMe',
+        {},
+        { fetchImpl: response(200, { ok: true, result: { username: 'fixture' } }) }
+      )
+    ).kind,
+    'OK'
+  );
+});
+test('same timeout, body and POST; no extra transport retries', async () => {
+  let calls = 0;
+  await request(async (url, opts) => {
+    calls++;
+    assert.equal(opts.method, 'POST');
+    assert.deepEqual(JSON.parse(opts.body), { chat_id: '123', text: 'fixture' });
+    assert.ok(opts.signal);
+    return response(200, { ok: true, result: { message_id: 1 } })();
+  });
+  assert.equal(calls, 1);
+});
+test('explicit ok=false is classified by API error_code even with HTTP200', async () => {
+  for (const code of [400, 403, 429, 500]) {
+    const r = await request(response(200, { ok: false, error_code: code, description: 'private' }));
+    assert.equal(r.kind, code >= 500 || code === 429 ? 'RETRYABLE' : 'FINAL');
+    assert.equal(r.error_code, code);
+    assert.ok(!JSON.stringify(r).includes('private'));
+  }
+});
+test('429 retry_after is a lower bound and retries remain bounded', async () => {
+  const r = await request(response(429, { ok: false, error_code: 429, parameters: { retry_after: 90 } }));
+  assert.equal(r.retry_after_ms, 90000);
+  assert.equal(deliveryDecision(r, { attempts: 0, possible_duplicate: 0 }, 100).next, 90100);
+  assert.equal(deliveryDecision(r, { attempts: 2, possible_duplicate: 0 }, 100).state, 'FAILED_FINAL');
+});
+test('5xx has at most three attempts; ambiguous is never automatically replayed', () => {
+  assert.equal(
+    deliveryDecision({ kind: 'RETRYABLE', reason: 'HTTP_503' }, { attempts: 1 }, 100).state,
+    'FAILED_RETRYABLE'
+  );
+  assert.equal(
+    deliveryDecision({ kind: 'RETRYABLE', reason: 'HTTP_503' }, { attempts: 2 }, 100).state,
+    'FAILED_FINAL'
+  );
+  assert.deepEqual(
+    deliveryDecision({ kind: 'AMBIGUOUS', reason: 'TRANSPORT_TIMEOUT' }, { attempts: 0 }, 100),
+    { state: 'DELIVERY_UNKNOWN', next: 0, error: 'TRANSPORT_TIMEOUT', possible: 1, delivered: null }
+  );
+});

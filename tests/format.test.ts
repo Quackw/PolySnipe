@@ -46,7 +46,9 @@ describe("renderActivityAlert", () => {
     expect(text).toContain(
       '<a href="https://polymarket.com/market/will-iran-strike-mina-al-ahmadi-refinery-by-march-31">Will Iran strike Mina Al Ahmadi refinery by March 31</a> | <b>TRADE</b>, outcome: <b>YES</b>, side: <b>BUY</b>, shares: <b>12.35</b>, avg price: <b>10¢</b>, usdcSize: <b>$99.50</b>'
     );
-    expect(text).toContain("Plain title without slug | <b>TRADE</b>, outcome: <b>NO</b>, side: <b>SELL</b>, shares: <b>12</b>, usdcSize: <b>$12.30</b>");
+    expect(text).toContain(
+      "Plain title without slug | <b>TRADE</b>, outcome: <b>NO</b>, side: <b>SELL</b>, shares: <b>12</b>, usdcSize: <b>$12.30</b>"
+    );
     expect(text).not.toContain("New Polymarket activity");
     expect(text).not.toContain("Proxy address");
     expect(text).not.toContain("Label:");
@@ -98,10 +100,20 @@ describe("renderActivityAlert", () => {
   it("shows the same compact trade values as the RTDS card", () => {
     const text = renderActivityAlert(
       { proxyAddress: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697", profileSlug: "Spirit-LT" },
-      [{ proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
-        timestamp: 100, type: "TRADE", title: "Will the price of Ethereum be above $2,700 on September 28?",
-        slug: "ethereum-above-2700-on-september-28-2026", outcome: "Yes", side: "BUY",
-        size: 100, price: 0.09, usdcSize: 9 }]
+      [
+        {
+          proxyWallet: "0x03e8a544e97eeff5753bc1e90d46e5ef22af1697",
+          timestamp: 100,
+          type: "TRADE",
+          title: "Will the price of Ethereum be above $2,700 on September 28?",
+          slug: "ethereum-above-2700-on-september-28-2026",
+          outcome: "Yes",
+          side: "BUY",
+          size: 100,
+          price: 0.09,
+          usdcSize: 9
+        }
+      ]
     );
     expect(text).toContain("shares: <b>100</b>, avg price: <b>9¢</b>, usdcSize: <b>$9.00</b>");
   });

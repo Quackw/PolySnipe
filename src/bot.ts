@@ -117,7 +117,11 @@ function isMessageNotModifiedError(error: unknown): boolean {
   return message.toLowerCase().includes("message is not modified");
 }
 
-async function editMessageHtml(ctx: Context, html: string, extra: Record<string, unknown> = {}): Promise<void> {
+async function editMessageHtml(
+  ctx: Context,
+  html: string,
+  extra: Record<string, unknown> = {}
+): Promise<void> {
   try {
     await ctx.editMessageText(html, {
       parse_mode: "HTML",
@@ -200,7 +204,12 @@ export function createTelegramBot(
       return;
     }
 
-    await replyHtml(ctx, renderAdminPerformanceReport(repo.getAdminPerformanceReport(Date.now(), config.alertDelayThresholdSec * 1000)));
+    await replyHtml(
+      ctx,
+      renderAdminPerformanceReport(
+        repo.getAdminPerformanceReport(Date.now(), config.alertDelayThresholdSec * 1000)
+      )
+    );
   }
 
   async function handleSubscribeStart(ctx: Context): Promise<void> {
@@ -239,11 +248,17 @@ export function createTelegramBot(
   }
 
   bot.command("start", async (ctx) => {
-    const deskWallet = String(ctx.match ?? '').match(/^desk_(0x[0-9a-fA-F]{40})$/)?.[1];
-    if (deskWallet && ctx.chat?.type === 'private') {
-      await replyHtml(ctx, `Track <code>${deskWallet}</code>? Future activity will be sent here. This is not a profitability recommendation.`, {
-        reply_markup: new InlineKeyboard().text('Confirm subscription', `deskadd:${deskWallet}`).text('Cancel', 'subcancel')
-      });
+    const deskWallet = String(ctx.match ?? "").match(/^desk_(0x[0-9a-fA-F]{40})$/)?.[1];
+    if (deskWallet && ctx.chat?.type === "private") {
+      await replyHtml(
+        ctx,
+        `Track <code>${deskWallet}</code>? Future activity will be sent here. This is not a profitability recommendation.`,
+        {
+          reply_markup: new InlineKeyboard()
+            .text("Confirm subscription", `deskadd:${deskWallet}`)
+            .text("Cancel", "subcancel")
+        }
+      );
       return;
     }
     const ids = await ensureSubscriber(ctx, repo);
@@ -259,17 +274,39 @@ export function createTelegramBot(
   bot.command("admin", openAdminMenu);
 
   bot.callbackQuery(/^deskadd:(0x[0-9a-fA-F]{40})$/, async (ctx) => {
-    if (ctx.chat?.type !== 'private' || ctx.from.id !== ctx.chat.id) { await ctx.answerCallbackQuery(); return; }
+    if (ctx.chat?.type !== "private" || ctx.from.id !== ctx.chat.id) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
     const ids = await ensureSubscriber(ctx, repo);
     if (!ids) return;
     try {
-      const account = await polymarket.resolveAccountInput({kind:'proxy_address',proxyAddress:ctx.match[1]!.toLowerCase()});
-      const nowMs=Date.now();
-      repo.upsertTrackedAccount({proxyAddress:account.proxyAddress,name:account.name,pseudonym:account.pseudonym,profileSlug:account.profileSlug,nextPollAtMs:nowMs});
-      const created=repo.createSubscription(ids.subscriberId,ids.chatId,account.proxyAddress,ids.userId,Math.floor(nowMs/1000));
+      const account = await polymarket.resolveAccountInput({
+        kind: "proxy_address",
+        proxyAddress: ctx.match[1]!.toLowerCase()
+      });
+      const nowMs = Date.now();
+      repo.upsertTrackedAccount({
+        proxyAddress: account.proxyAddress,
+        name: account.name,
+        pseudonym: account.pseudonym,
+        profileSlug: account.profileSlug,
+        nextPollAtMs: nowMs
+      });
+      const created = repo.createSubscription(
+        ids.subscriberId,
+        ids.chatId,
+        account.proxyAddress,
+        ids.userId,
+        Math.floor(nowMs / 1000)
+      );
       await ctx.answerCallbackQuery();
-      await editMessageHtml(ctx,renderSubscriptionCreated(account,created.created),{reply_markup:new InlineKeyboard()});
-    } catch { await ctx.answerCallbackQuery({text:'Could not subscribe. Try again.'}); }
+      await editMessageHtml(ctx, renderSubscriptionCreated(account, created.created), {
+        reply_markup: new InlineKeyboard()
+      });
+    } catch {
+      await ctx.answerCallbackQuery({ text: "Could not subscribe. Try again." });
+    }
   });
 
   bot.hears(/^Subscribe$/i, handleSubscribeStart);
@@ -331,7 +368,11 @@ export function createTelegramBot(
     await ctx.answerCallbackQuery();
     await editMessageHtml(
       ctx,
-      renderUnsubscribePrompt(subscriptions, clampPage(page, pageCount(subscriptions.length, UNSUBSCRIBE_PAGE_SIZE)), pageCount(subscriptions.length, UNSUBSCRIBE_PAGE_SIZE)),
+      renderUnsubscribePrompt(
+        subscriptions,
+        clampPage(page, pageCount(subscriptions.length, UNSUBSCRIBE_PAGE_SIZE)),
+        pageCount(subscriptions.length, UNSUBSCRIBE_PAGE_SIZE)
+      ),
       {
         reply_markup: renderUnsubscribeKeyboard(subscriptions, page)
       }
@@ -369,7 +410,10 @@ export function createTelegramBot(
 
     const result = repo.removeAllSubscriptions(ctx.chat.id);
     await ctx.answerCallbackQuery();
-    await editMessageHtml(ctx, renderUnsubscribedAll(result.removedSubscriptions, result.removedTrackedAccounts));
+    await editMessageHtml(
+      ctx,
+      renderUnsubscribedAll(result.removedSubscriptions, result.removedTrackedAccounts)
+    );
   });
 
   bot.on("message:text", async (ctx) => {
@@ -422,14 +466,18 @@ export function createTelegramBot(
         nextPollAtMs: nowMs
       });
 
-      const created = repo.createSubscription(ids.subscriberId, ids.chatId, account.proxyAddress, ids.userId, nowSec);
+      const created = repo.createSubscription(
+        ids.subscriberId,
+        ids.chatId,
+        account.proxyAddress,
+        ids.userId,
+        nowSec
+      );
       repo.clearChatSession(ids.chatId);
 
-      await replyHtml(
-        ctx,
-        renderSubscriptionCreated(account, created.created),
-        { reply_markup: mainKeyboard(ctx) }
-      );
+      await replyHtml(ctx, renderSubscriptionCreated(account, created.created), {
+        reply_markup: mainKeyboard(ctx)
+      });
     } catch (error) {
       await replyHtml(
         ctx,

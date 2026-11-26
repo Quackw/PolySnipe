@@ -5,27 +5,40 @@ beforeEach(() => {
   vi.stubEnv("TELEGRAM_BOT_TOKEN", "test");
   vi.stubEnv("SQLITE_PATH", ":memory:");
   for (const name of [
-    "SCHEDULER_TICK_MS", "HTTP_TIMEOUT_MS", "HTTP_RETRIES",
-    "POLYMARKET_TIMEOUT_MS", "POLYMARKET_RETRIES", "TELEGRAM_TIMEOUT_MS"
-  ]) vi.stubEnv(name, undefined);
+    "SCHEDULER_TICK_MS",
+    "HTTP_TIMEOUT_MS",
+    "HTTP_RETRIES",
+    "POLYMARKET_TIMEOUT_MS",
+    "POLYMARKET_RETRIES",
+    "TELEGRAM_TIMEOUT_MS"
+  ])
+    vi.stubEnv(name, undefined);
 });
 afterEach(() => vi.unstubAllEnvs());
 
-it.each([undefined, "", "   "])("uses documented defaults for unset or blank numeric values (%j)", (value) => {
-  for (const name of [
-    "SCHEDULER_TICK_MS", "HTTP_TIMEOUT_MS", "HTTP_RETRIES",
-    "POLYMARKET_TIMEOUT_MS", "POLYMARKET_RETRIES", "TELEGRAM_TIMEOUT_MS"
-  ]) vi.stubEnv(name, value);
-  expect(loadConfig()).toMatchObject({
-    sqlitePath: ":memory:",
-    schedulerTickMs: 250,
-    httpTimeoutMs: 15_000,
-    httpRetries: 2,
-    polymarketTimeoutMs: 15_000,
-    polymarketRetries: 1,
-    telegramTimeoutMs: 15_000
-  });
-});
+it.each([undefined, "", "   "])(
+  "uses documented defaults for unset or blank numeric values (%j)",
+  (value) => {
+    for (const name of [
+      "SCHEDULER_TICK_MS",
+      "HTTP_TIMEOUT_MS",
+      "HTTP_RETRIES",
+      "POLYMARKET_TIMEOUT_MS",
+      "POLYMARKET_RETRIES",
+      "TELEGRAM_TIMEOUT_MS"
+    ])
+      vi.stubEnv(name, value);
+    expect(loadConfig()).toMatchObject({
+      sqlitePath: ":memory:",
+      schedulerTickMs: 250,
+      httpTimeoutMs: 15_000,
+      httpRetries: 2,
+      polymarketTimeoutMs: 15_000,
+      polymarketRetries: 1,
+      telegramTimeoutMs: 15_000
+    });
+  }
+);
 
 it("inherits supplied legacy HTTP values, including zero retries, and accepts explicit overrides", () => {
   vi.stubEnv("HTTP_TIMEOUT_MS", " 2400 ");
@@ -33,7 +46,10 @@ it("inherits supplied legacy HTTP values, including zero retries, and accepts ex
   vi.stubEnv("TELEGRAM_TIMEOUT_MS", " 3600 ");
   vi.stubEnv("POLYMARKET_RETRIES", " ");
   expect(loadConfig()).toMatchObject({
-    polymarketTimeoutMs: 2_400, polymarketRetries: 0, httpRetries: 0, telegramTimeoutMs: 3_600
+    polymarketTimeoutMs: 2_400,
+    polymarketRetries: 0,
+    httpRetries: 0,
+    telegramTimeoutMs: 3_600
   });
   vi.stubEnv("POLYMARKET_RETRIES", "3");
   expect(loadConfig().polymarketRetries).toBe(3);

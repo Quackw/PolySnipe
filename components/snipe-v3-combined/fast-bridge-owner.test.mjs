@@ -1,6 +1,49 @@
-import test from 'node:test';import assert from 'node:assert/strict';import {createFastBridgeOwner} from './fast-bridge-owner.mjs';
-const scopeFingerprint='a'.repeat(64),fixture=(dispatch=()=>[{kind:'SEND_FIRST_ACTION'}])=>{let ready=true,n=0;const owner=createFastBridgeOwner({scopeFingerprint,isReady:()=>ready,now:()=>1700000000000,dispatch:(...a)=>{n++;return dispatch(...a);}});return {owner,disable(){ready=false;},count:()=>n};};
-const pkt=(s,n=1)=>({...s,sequence:n,message_id:'id-'+n,envelope:{}});
-test('B shares one writer, identical receipt is acknowledged once, stale sessions fail',()=>{const f=fixture(),s=f.owner.openSource('B');assert.equal(f.owner.submit(pkt(s)).status,'ACCEPTED');assert.equal(f.owner.submit(pkt(s)).status,'ALREADY_COMMITTED');assert.equal(f.count(),1);f.owner.disconnectSource(s);assert.equal(f.owner.submit(pkt(s,2)).reason,'SOURCE_DISCONNECTED_OR_OBSOLETE');});
-test('scope drift or unsafe admission fails closed',()=>{const f=fixture(()=>[{kind:'BLOCKED',reason:'STATE_TOO_STALE'}]),s=f.owner.openSource('B');assert.equal(f.owner.submit(pkt(s)).reason,'ADMISSIONS_HALTED');f.disable();assert.equal(f.owner.submit(pkt(s)).reason,'FROZEN_SCOPE_CHANGED');});
-test('ambiguous duplicate remains blocked and cannot be called delivered',()=>{const f=fixture(()=>[{kind:'SUPPRESS_SAME_ACTION',ambiguous:true}]),s=f.owner.openSource('B'),r=f.owner.submit(pkt(s));assert.equal(r.status,'DUPLICATE');assert.equal(r.results[0].status,'BLOCKED');assert.equal(f.owner.submit(pkt(s)).results[0].status,'BLOCKED');});
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createFastBridgeOwner } from './fast-bridge-owner.mjs';
+const scopeFingerprint = 'a'.repeat(64),
+  fixture = (dispatch = () => [{ kind: 'SEND_FIRST_ACTION' }]) => {
+    let ready = true,
+      n = 0;
+    const owner = createFastBridgeOwner({
+      scopeFingerprint,
+      isReady: () => ready,
+      now: () => 1700000000000,
+      dispatch: (...a) => {
+        n++;
+        return dispatch(...a);
+      }
+    });
+    return {
+      owner,
+      disable() {
+        ready = false;
+      },
+      count: () => n
+    };
+  };
+const pkt = (s, n = 1) => ({ ...s, sequence: n, message_id: 'id-' + n, envelope: {} });
+test('B shares one writer, identical receipt is acknowledged once, stale sessions fail', () => {
+  const f = fixture(),
+    s = f.owner.openSource('B');
+  assert.equal(f.owner.submit(pkt(s)).status, 'ACCEPTED');
+  assert.equal(f.owner.submit(pkt(s)).status, 'ALREADY_COMMITTED');
+  assert.equal(f.count(), 1);
+  f.owner.disconnectSource(s);
+  assert.equal(f.owner.submit(pkt(s, 2)).reason, 'SOURCE_DISCONNECTED_OR_OBSOLETE');
+});
+test('scope drift or unsafe admission fails closed', () => {
+  const f = fixture(() => [{ kind: 'BLOCKED', reason: 'STATE_TOO_STALE' }]),
+    s = f.owner.openSource('B');
+  assert.equal(f.owner.submit(pkt(s)).reason, 'ADMISSIONS_HALTED');
+  f.disable();
+  assert.equal(f.owner.submit(pkt(s)).reason, 'FROZEN_SCOPE_CHANGED');
+});
+test('ambiguous duplicate remains blocked and cannot be called delivered', () => {
+  const f = fixture(() => [{ kind: 'SUPPRESS_SAME_ACTION', ambiguous: true }]),
+    s = f.owner.openSource('B'),
+    r = f.owner.submit(pkt(s));
+  assert.equal(r.status, 'DUPLICATE');
+  assert.equal(r.results[0].status, 'BLOCKED');
+  assert.equal(f.owner.submit(pkt(s)).results[0].status, 'BLOCKED');
+});

@@ -55,6 +55,8 @@ describe("createAdminNotifier", () => {
     expect(sendTelegram).toHaveBeenCalledTimes(2);
     expect(sendTelegram).toHaveBeenNthCalledWith(1, 10, expect.any(String));
     expect(sendTelegram).toHaveBeenNthCalledWith(2, 20, expect.any(String));
-    expect(log).toHaveBeenCalledWith(expect.stringContaining("[notify:error] source=startup admin=10 error=telegram failed"));
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("[notify:error] source=startup admin=10 error=telegram failed")
+    );
   });
 });

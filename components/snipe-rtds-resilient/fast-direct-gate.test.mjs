@@ -1,31 +1,256 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';import os from 'node:os';import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import Database from 'better-sqlite3';
-import {createSendOnce} from '../holy-snipe-fast/send-once.mjs';
-import {eventKey} from '../holy-snipe-fast/identity.mjs';
-import {createDirectAdmissionGate} from './fast-direct-gate.mjs';
-const wallet=n=>'0x'+String(n).padStart(40,'0');
-function fixture({dynamicProtected=false}={}){
- const root=fs.mkdtempSync(path.join(os.tmpdir(),'rtds-gate-')),db=new Database(':memory:');let m=0,reads=0,jumpAt=Infinity,jump=0,disabled=null,active=true;
- db.exec("CREATE TABLE deliveries(event_key TEXT,chat_id INTEGER,wallet TEXT,source_timestamp INTEGER,first_seen_at_ms INTEGER,message_html TEXT,state TEXT DEFAULT 'PENDING',next_at_ms INTEGER,delivered_at_ms INTEGER,claim_token TEXT,PRIMARY KEY(event_key,chat_id))");
- const wallets=Array.from({length:6},(_,i)=>wallet(i+1));fs.writeFileSync(path.join(root,'send-once-canary.json'),JSON.stringify({version:2,start_ms:1,subscriptions:wallets.map(wallet=>({wallet,recipient:42}))}));
- const sendOnce=createSendOnce(db,{root,ownerIds:[42],recipientMap:new Map(wallets.map(w=>[w,[{chat_id:42,notify_from_ts:0}]])),insert:db.prepare('INSERT OR IGNORE INTO deliveries(event_key,chat_id,wallet,source_timestamp,first_seen_at_ms,message_html,next_at_ms) VALUES(?,?,?,?,?,?,?)'),dynamicProtected});
- const gate=createDirectAdmissionGate({db,sendOnce,readCurrentPair:()=>active?{notify_from_ts:0}:null,isEnabled:()=>!disabled,disable:r=>{disabled=r;},allowNewPairHistoryBlock:dynamicProtected,mono:()=>{reads++;return m+(reads>=jumpAt?jump:0);}});
- const trade={wallet:wallets[0],hash:'0x'+'1'.repeat(64),asset:'asset',side:'BUY',size:'5',price:.5,timestamp:1800000000};
- return {db,trade,gate,sendOnce,run(t=trade){return gate(t,42,eventKey(t),'trace','original card',1,1);},fault(ms,at=2){reads=0;jump=ms;jumpAt=at;},inactive(){active=false;},get disabled(){return disabled;},close(){db.close();fs.rmSync(root,{recursive:true,force:true});}};
+import { createSendOnce } from '../holy-snipe-fast/send-once.mjs';
+import { eventKey } from '../holy-snipe-fast/identity.mjs';
+import { createDirectAdmissionGate } from './fast-direct-gate.mjs';
+const wallet = (n) => '0x' + String(n).padStart(40, '0');
+function fixture({ dynamicProtected = false } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rtds-gate-')),
+    db = new Database(':memory:');
+  let m = 0,
+    reads = 0,
+    jumpAt = Infinity,
+    jump = 0,
+    disabled = null,
+    active = true;
+  db.exec(
+    "CREATE TABLE deliveries(event_key TEXT,chat_id INTEGER,wallet TEXT,source_timestamp INTEGER,first_seen_at_ms INTEGER,message_html TEXT,state TEXT DEFAULT 'PENDING',next_at_ms INTEGER,delivered_at_ms INTEGER,claim_token TEXT,PRIMARY KEY(event_key,chat_id))"
+  );
+  const wallets = Array.from({ length: 6 }, (_, i) => wallet(i + 1));
+  fs.writeFileSync(
+    path.join(root, 'send-once-canary.json'),
+    JSON.stringify({
+      version: 2,
+      start_ms: 1,
+      subscriptions: wallets.map((wallet) => ({ wallet, recipient: 42 }))
+    })
+  );
+  const sendOnce = createSendOnce(db, {
+    root,
+    ownerIds: [42],
+    recipientMap: new Map(wallets.map((w) => [w, [{ chat_id: 42, notify_from_ts: 0 }]])),
+    insert: db.prepare(
+      'INSERT OR IGNORE INTO deliveries(event_key,chat_id,wallet,source_timestamp,first_seen_at_ms,message_html,next_at_ms) VALUES(?,?,?,?,?,?,?)'
+    ),
+    dynamicProtected
+  });
+  const gate = createDirectAdmissionGate({
+    db,
+    sendOnce,
+    readCurrentPair: () => (active ? { notify_from_ts: 0 } : null),
+    isEnabled: () => !disabled,
+    disable: (r) => {
+      disabled = r;
+    },
+    allowNewPairHistoryBlock: dynamicProtected,
+    mono: () => {
+      reads++;
+      return m + (reads >= jumpAt ? jump : 0);
+    }
+  });
+  const trade = {
+    wallet: wallets[0],
+    hash: '0x' + '1'.repeat(64),
+    asset: 'asset',
+    side: 'BUY',
+    size: '5',
+    price: 0.5,
+    timestamp: 1800000000
+  };
+  return {
+    db,
+    trade,
+    gate,
+    sendOnce,
+    run(t = trade) {
+      return gate(t, 42, eventKey(t), 'trace', 'original card', 1, 1);
+    },
+    fault(ms, at = 2) {
+      reads = 0;
+      jump = ms;
+      jumpAt = at;
+    },
+    inactive() {
+      active = false;
+    },
+    get disabled() {
+      return disabled;
+    },
+    close() {
+      db.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
 }
-test('real original SEND-ONCE nested under one fresh SQLite transaction, duplicate B preserves first card',()=>{const f=fixture();try{assert.equal(f.run().kind,'SEND_FIRST_ACTION');assert.equal(f.run({...f.trade,size:'50',price:.9}).kind,'SUPPRESS_SAME_ACTION');assert.equal(f.db.prepare('SELECT COUNT(*) n FROM deliveries').get().n,1);assert.equal(f.db.prepare('SELECT message_html FROM deliveries').get().message_html,'original card');}finally{f.close();}});
-for(const ms of [1999,2000,2000.01])test(`production gate state bound ${ms}ms`,()=>{const f=fixture();try{f.fault(ms);assert.equal(f.run().kind,ms<=2000?'SEND_FIRST_ACTION':'BLOCKED');assert.equal(f.db.prepare('SELECT COUNT(*) n FROM deliveries').get().n,ms<=2000?1:0);}finally{f.close();}});
-test('production gate postcommit overrun disables sender but keeps reservation; no legacy fallback',()=>{const f=fixture();try{f.fault(2001,4);const r=f.run();assert.equal(r.kind,'BLOCKED');assert.equal(r.committed,true);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM send_once_actions').get().n,1);assert.equal(f.disabled,'RTDS_DIRECT_ADMISSION_SAFETY_STOP');}finally{f.close();}});
-test('fresh unsubscribe blocks admission; ambiguous and orphan prior actions remain reserved',()=>{const f=fixture();try{assert.equal(f.run().kind,'SEND_FIRST_ACTION');f.db.exec("UPDATE deliveries SET state='DELIVERY_UNKNOWN'");assert.equal(f.run().kind,'SUPPRESS_SAME_ACTION');f.db.exec('DELETE FROM deliveries');assert.equal(f.run().kind,'SUPPRESS_SAME_ACTION');f.inactive();assert.equal(f.run().reason,'SUBSCRIPTION_INACTIVE');assert.equal(f.disabled,null);}finally{f.close();}});
-test('dynamic protection reserves a new pair in the same writer transaction and suppresses duplicates',()=>{const f=fixture({dynamicProtected:true});try{const newer={...f.trade,wallet:wallet(7)};assert.equal(f.sendOnce.applies(newer.wallet,42),true);assert.equal(f.run(newer).kind,'SEND_FIRST_ACTION');assert.equal(f.run(newer).kind,'SUPPRESS_SAME_ACTION');assert.equal(f.run().kind,'SEND_FIRST_ACTION');assert.equal(f.disabled,null);}finally{f.close();}});
-test('dynamic protection rejects invalid wallet and recipient identities',()=>{const f=fixture({dynamicProtected:true});try{for(const value of [null,undefined,'','bad'])assert.equal(f.sendOnce.applies(value,42),false);for(const value of [null,0,-1,1.5,'42'])assert.equal(f.sendOnce.applies(wallet(7),value),false);}finally{f.close();}});
-test('unmapped history fences just that pair without disabling unrelated subscribers',()=>{const f=fixture({dynamicProtected:true});try{const newer={...f.trade,wallet:wallet(7)};f.db.prepare("INSERT INTO deliveries(event_key,chat_id,wallet,source_timestamp,state) VALUES(?,?,?,?,?)").run('old-unmapped',42,newer.wallet,newer.timestamp,'DELIVERED');assert.equal(f.run(newer).reason,'UNMAPPED_LEGACY_DELIVERY');assert.equal(f.disabled,null);assert.equal(f.run().kind,'SEND_FIRST_ACTION');}finally{f.close();}});
+test('real original SEND-ONCE nested under one fresh SQLite transaction, duplicate B preserves first card', () => {
+  const f = fixture();
+  try {
+    assert.equal(f.run().kind, 'SEND_FIRST_ACTION');
+    assert.equal(f.run({ ...f.trade, size: '50', price: 0.9 }).kind, 'SUPPRESS_SAME_ACTION');
+    assert.equal(f.db.prepare('SELECT COUNT(*) n FROM deliveries').get().n, 1);
+    assert.equal(f.db.prepare('SELECT message_html FROM deliveries').get().message_html, 'original card');
+  } finally {
+    f.close();
+  }
+});
+for (const ms of [1999, 2000, 2000.01])
+  test(`production gate state bound ${ms}ms`, () => {
+    const f = fixture();
+    try {
+      f.fault(ms);
+      assert.equal(f.run().kind, ms <= 2000 ? 'SEND_FIRST_ACTION' : 'BLOCKED');
+      assert.equal(f.db.prepare('SELECT COUNT(*) n FROM deliveries').get().n, ms <= 2000 ? 1 : 0);
+    } finally {
+      f.close();
+    }
+  });
+test('production gate postcommit overrun disables sender but keeps reservation; no legacy fallback', () => {
+  const f = fixture();
+  try {
+    f.fault(2001, 4);
+    const r = f.run();
+    assert.equal(r.kind, 'BLOCKED');
+    assert.equal(r.committed, true);
+    assert.equal(f.db.prepare('SELECT COUNT(*) n FROM send_once_actions').get().n, 1);
+    assert.equal(f.disabled, 'RTDS_DIRECT_ADMISSION_SAFETY_STOP');
+  } finally {
+    f.close();
+  }
+});
+test('fresh unsubscribe blocks admission; ambiguous and orphan prior actions remain reserved', () => {
+  const f = fixture();
+  try {
+    assert.equal(f.run().kind, 'SEND_FIRST_ACTION');
+    f.db.exec("UPDATE deliveries SET state='DELIVERY_UNKNOWN'");
+    assert.equal(f.run().kind, 'SUPPRESS_SAME_ACTION');
+    f.db.exec('DELETE FROM deliveries');
+    assert.equal(f.run().kind, 'SUPPRESS_SAME_ACTION');
+    f.inactive();
+    assert.equal(f.run().reason, 'SUBSCRIPTION_INACTIVE');
+    assert.equal(f.disabled, null);
+  } finally {
+    f.close();
+  }
+});
+test('dynamic protection reserves a new pair in the same writer transaction and suppresses duplicates', () => {
+  const f = fixture({ dynamicProtected: true });
+  try {
+    const newer = { ...f.trade, wallet: wallet(7) };
+    assert.equal(f.sendOnce.applies(newer.wallet, 42), true);
+    assert.equal(f.run(newer).kind, 'SEND_FIRST_ACTION');
+    assert.equal(f.run(newer).kind, 'SUPPRESS_SAME_ACTION');
+    assert.equal(f.run().kind, 'SEND_FIRST_ACTION');
+    assert.equal(f.disabled, null);
+  } finally {
+    f.close();
+  }
+});
+test('dynamic protection rejects invalid wallet and recipient identities', () => {
+  const f = fixture({ dynamicProtected: true });
+  try {
+    for (const value of [null, undefined, '', 'bad']) assert.equal(f.sendOnce.applies(value, 42), false);
+    for (const value of [null, 0, -1, 1.5, '42']) assert.equal(f.sendOnce.applies(wallet(7), value), false);
+  } finally {
+    f.close();
+  }
+});
+test('unmapped history fences just that pair without disabling unrelated subscribers', () => {
+  const f = fixture({ dynamicProtected: true });
+  try {
+    const newer = { ...f.trade, wallet: wallet(7) };
+    f.db
+      .prepare('INSERT INTO deliveries(event_key,chat_id,wallet,source_timestamp,state) VALUES(?,?,?,?,?)')
+      .run('old-unmapped', 42, newer.wallet, newer.timestamp, 'DELIVERED');
+    assert.equal(f.run(newer).reason, 'UNMAPPED_LEGACY_DELIVERY');
+    assert.equal(f.disabled, null);
+    assert.equal(f.run().kind, 'SEND_FIRST_ACTION');
+  } finally {
+    f.close();
+  }
+});
 
-function claimed(f){f.run();f.db.exec("UPDATE deliveries SET state='SENDING',claim_token='fixture-claim'");return {event_key:eventKey(f.trade),chat_id:42,wallet:f.trade.wallet,source_timestamp:f.trade.timestamp,claimToken:'fixture-claim'};}
-for(const ms of [1999,2000,2000.01])test(`final pre-transport guard includes earlier IO and lock time: ${ms}ms`,()=>{const f=fixture();try{const row=claimed(f);f.fault(ms,2);const result=f.gate.beforeSend(row,0);assert.equal(result.allow,ms<=2000);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM send_once_actions').get().n,1);assert.equal(f.db.prepare('SELECT state FROM deliveries').get().state,'SENDING');}finally{f.close();}});
-test('final pre-transport postcommit overrun retains the claim and fails closed',()=>{const f=fixture();try{const row=claimed(f);f.fault(2001,4);assert.equal(f.gate.beforeSend(row,0).allow,false);assert.equal(f.disabled,'RTDS_DIRECT_BEFORE_SEND_SAFETY_STOP');assert.equal(f.db.prepare('SELECT claim_token FROM deliveries').get().claim_token,'fixture-claim');}finally{f.close();}});
-test('final pre-transport guard rejects changed claim and UNKNOWN',()=>{for(const fault of ['token','unknown']){const f=fixture();try{const row=claimed(f);if(fault==='token')row.claimToken='other';if(fault==='unknown')f.db.exec("UPDATE deliveries SET state='DELIVERY_UNKNOWN'");assert.equal(f.gate.beforeSend(row,0).allow,false);assert.ok(f.disabled);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM send_once_actions').get().n,1);}finally{f.close();}}});
-test('unsubscribe before transport blocks only that claim and preserves its reservation',()=>{const f=fixture();try{const row=claimed(f);f.inactive();assert.deepEqual(f.gate.beforeSend(row,0),{allow:false,reason:'SUBSCRIPTION_INACTIVE'});assert.equal(f.disabled,null);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM send_once_actions').get().n,1);assert.equal(f.db.prepare('SELECT state FROM deliveries').get().state,'SENDING');}finally{f.close();}});
-test('unsubscribe cannot hide a changed claim or stale state',()=>{for(const fault of ['token','stale']){const f=fixture();try{const row=claimed(f);f.inactive();if(fault==='token')row.claimToken='other';else f.fault(2001);assert.equal(f.gate.beforeSend(row,0).allow,false);assert.ok(f.disabled);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM send_once_actions').get().n,1);}finally{f.close();}}});
+function claimed(f) {
+  f.run();
+  f.db.exec("UPDATE deliveries SET state='SENDING',claim_token='fixture-claim'");
+  return {
+    event_key: eventKey(f.trade),
+    chat_id: 42,
+    wallet: f.trade.wallet,
+    source_timestamp: f.trade.timestamp,
+    claimToken: 'fixture-claim'
+  };
+}
+for (const ms of [1999, 2000, 2000.01])
+  test(`final pre-transport guard includes earlier IO and lock time: ${ms}ms`, () => {
+    const f = fixture();
+    try {
+      const row = claimed(f);
+      f.fault(ms, 2);
+      const result = f.gate.beforeSend(row, 0);
+      assert.equal(result.allow, ms <= 2000);
+      assert.equal(f.db.prepare('SELECT COUNT(*) n FROM send_once_actions').get().n, 1);
+      assert.equal(f.db.prepare('SELECT state FROM deliveries').get().state, 'SENDING');
+    } finally {
+      f.close();
+    }
+  });
+test('final pre-transport postcommit overrun retains the claim and fails closed', () => {
+  const f = fixture();
+  try {
+    const row = claimed(f);
+    f.fault(2001, 4);
+    assert.equal(f.gate.beforeSend(row, 0).allow, false);
+    assert.equal(f.disabled, 'RTDS_DIRECT_BEFORE_SEND_SAFETY_STOP');
+    assert.equal(f.db.prepare('SELECT claim_token FROM deliveries').get().claim_token, 'fixture-claim');
+  } finally {
+    f.close();
+  }
+});
+test('final pre-transport guard rejects changed claim and UNKNOWN', () => {
+  for (const fault of ['token', 'unknown']) {
+    const f = fixture();
+    try {
+      const row = claimed(f);
+      if (fault === 'token') row.claimToken = 'other';
+      if (fault === 'unknown') f.db.exec("UPDATE deliveries SET state='DELIVERY_UNKNOWN'");
+      assert.equal(f.gate.beforeSend(row, 0).allow, false);
+      assert.ok(f.disabled);
+      assert.equal(f.db.prepare('SELECT COUNT(*) n FROM send_once_actions').get().n, 1);
+    } finally {
+      f.close();
+    }
+  }
+});
+test('unsubscribe before transport blocks only that claim and preserves its reservation', () => {
+  const f = fixture();
+  try {
+    const row = claimed(f);
+    f.inactive();
+    assert.deepEqual(f.gate.beforeSend(row, 0), { allow: false, reason: 'SUBSCRIPTION_INACTIVE' });
+    assert.equal(f.disabled, null);
+    assert.equal(f.db.prepare('SELECT COUNT(*) n FROM send_once_actions').get().n, 1);
+    assert.equal(f.db.prepare('SELECT state FROM deliveries').get().state, 'SENDING');
+  } finally {
+    f.close();
+  }
+});
+test('unsubscribe cannot hide a changed claim or stale state', () => {
+  for (const fault of ['token', 'stale']) {
+    const f = fixture();
+    try {
+      const row = claimed(f);
+      f.inactive();
+      if (fault === 'token') row.claimToken = 'other';
+      else f.fault(2001);
+      assert.equal(f.gate.beforeSend(row, 0).allow, false);
+      assert.ok(f.disabled);
+      assert.equal(f.db.prepare('SELECT COUNT(*) n FROM send_once_actions').get().n, 1);
+    } finally {
+      f.close();
+    }
+  }
+});

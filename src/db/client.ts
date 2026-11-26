@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { configureSqlite } from "./sqlite-pragmas.mjs";
 
 export function openDb(dbPath: string): Database.Database {
   if (dbPath !== ":memory:") {
@@ -8,8 +9,7 @@ export function openDb(dbPath: string): Database.Database {
   }
 
   const db = new Database(dbPath);
-  db.pragma("busy_timeout = 5000");
-  db.pragma("journal_mode = WAL");
+  configureSqlite(db);
   db.pragma("synchronous = NORMAL");
   db.pragma("foreign_keys = ON");
 

@@ -57,7 +57,12 @@ afterEach(() => {
 function launch(event: RuntimeEvent) {
   const existing = getEventListeners(process, event);
   let finishPolling!: () => void;
-  runtime.botStart.mockImplementation(() => new Promise<void>((resolve) => { finishPolling = resolve; }));
+  runtime.botStart.mockImplementation(
+    () =>
+      new Promise<void>((resolve) => {
+        finishPolling = resolve;
+      })
+  );
   runtime.botStop.mockImplementation(async () => finishPolling());
   const finished = main(testConfig(":memory:"));
   const handler = getEventListeners(process, event).find((listener) => !existing.includes(listener))!;
@@ -67,7 +72,12 @@ function launch(event: RuntimeEvent) {
 
 it("closes the actual database after both Telegram polling and the scheduler drain", async () => {
   let finishDrain!: () => void;
-  runtime.schedulerDrain.mockImplementation(() => new Promise<void>((resolve) => { finishDrain = resolve; }));
+  runtime.schedulerDrain.mockImplementation(
+    () =>
+      new Promise<void>((resolve) => {
+        finishDrain = resolve;
+      })
+  );
   const { finished, handler, db } = launch("SIGTERM");
   handler();
   await vi.advanceTimersByTimeAsync(0);
@@ -107,7 +117,12 @@ it("forces exit at the original hard deadline if the scheduler drain also hangs"
   const forcedExit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
   vi.mocked(notifyFatalError).mockReturnValue(new Promise<void>(() => {}));
   let finishDrain!: () => void;
-  runtime.schedulerDrain.mockImplementation(() => new Promise<void>((resolve) => { finishDrain = resolve; }));
+  runtime.schedulerDrain.mockImplementation(
+    () =>
+      new Promise<void>((resolve) => {
+        finishDrain = resolve;
+      })
+  );
   const { finished, handler, db } = launch("unhandledRejection");
   handler(new Error("fixture"));
   await vi.advanceTimersByTimeAsync(19_999);

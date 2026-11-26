@@ -62,7 +62,11 @@ function classifyDelayReason(metrics: DelayPhaseMetrics, thresholdMs: number): D
   return "telegram_slow";
 }
 
-async function runWithConcurrency<T>(limit: number, items: readonly T[], worker: (item: T) => Promise<void>): Promise<void> {
+async function runWithConcurrency<T>(
+  limit: number,
+  items: readonly T[],
+  worker: (item: T) => Promise<void>
+): Promise<void> {
   const concurrency = Math.max(1, limit);
   let index = 0;
 
@@ -78,11 +82,15 @@ async function runWithConcurrency<T>(limit: number, items: readonly T[], worker:
   });
 
   const results = await Promise.allSettled(runners);
-  const failure = results.find(result => result.status === 'rejected');
-  if (failure?.status === 'rejected') throw failure.reason;
+  const failure = results.find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
 }
 
-export function calculateEffectiveIntervalMs(uniqueTrackedAccounts: number, safeRps: number, targetIntervalSec: number): number {
+export function calculateEffectiveIntervalMs(
+  uniqueTrackedAccounts: number,
+  safeRps: number,
+  targetIntervalSec: number
+): number {
   const adaptiveSeconds = Math.ceil(Math.max(0, uniqueTrackedAccounts) / Math.max(1, safeRps));
   return Math.max(targetIntervalSec, adaptiveSeconds) * 1000;
 }
@@ -129,7 +137,10 @@ export class PollScheduler {
     }, this.config.schedulerTickMs);
     this.rebalanceTimer = setInterval(() => this.runRebalance(), this.config.rebalanceEveryMs);
     this.orphanCleanupTimer = setInterval(() => this.runOrphanCleanup(), this.config.orphanCleanupEveryMs);
-    this.staleInflightTimer = setInterval(() => this.runStaleInflightRecovery(), this.config.staleInflightRecoveryEveryMs);
+    this.staleInflightTimer = setInterval(
+      () => this.runStaleInflightRecovery(),
+      this.config.staleInflightRecoveryEveryMs
+    );
     this.walTimer = setInterval(() => this.runWalCheckpoint(), this.config.walCheckpointEveryMs);
     this.heartbeatTimer = setInterval(() => this.runHeartbeat(), this.config.heartbeatEveryMs);
 
@@ -169,7 +180,10 @@ export class PollScheduler {
     try {
       while (!this.stopped && this.activePolls < this.config.activityConcurrency) {
         const nowMs = Date.now();
-        const dueAccounts = this.repo.listDueTrackedAccounts(nowMs, this.config.activityConcurrency - this.activePolls);
+        const dueAccounts = this.repo.listDueTrackedAccounts(
+          nowMs,
+          this.config.activityConcurrency - this.activePolls
+        );
         if (dueAccounts.length === 0) {
           break;
         }
@@ -238,14 +252,21 @@ export class PollScheduler {
         lastSeenKeys: watermark.nextState.lastSeenKeys,
         lastPolledAtMs: Date.now(),
         nextPollAtMs,
-        alerts: watermark.bootstrap ? [] : this.prepareAlerts(tracked, watermark.newActivities, {pollStartedAtMs,fetchCompletedAtMs})
+        alerts: watermark.bootstrap
+          ? []
+          : this.prepareAlerts(tracked, watermark.newActivities, { pollStartedAtMs, fetchCompletedAtMs })
       });
 
       if (!watermark.bootstrap && process.env.HOLY_DESK_EXPORT_MODULE) {
         try {
           const bridge = await import(process.env.HOLY_DESK_EXPORT_MODULE);
-          await bridge.exportSnipe(watermark.newActivities,this.repo.listSubscriptionsForAccount(proxyAddress));
-        } catch { this.deps.log('[desk] export unavailable'); }
+          await bridge.exportSnipe(
+            watermark.newActivities,
+            this.repo.listSubscriptionsForAccount(proxyAddress)
+          );
+        } catch {
+          this.deps.log("[desk] export unavailable");
+        }
       }
       const alertsSent = await this.dispatchAlerts();
       const status: PollRunStatus = watermark.bootstrap ? "bootstrap" : "ok";
@@ -302,16 +323,23 @@ export class PollScheduler {
     timing: { pollStartedAtMs: number; fetchCompletedAtMs: number }
   ): OutboxInsert[] {
     const resolvedAccount: ResolvedAccount = {
-      proxyAddress: account.proxyAddress, name: account.name,
-      pseudonym: account.pseudonym, profileSlug: account.profileSlug
+      proxyAddress: account.proxyAddress,
+      name: account.name,
+      pseudonym: account.pseudonym,
+      profileSlug: account.profileSlug
     };
-    return this.repo.listSubscriptionsForAccount(account.proxyAddress).flatMap(subscription => {
-      const visibleActivities = activities.filter(activity => activity.timestamp >= subscription.notifyFromTs);
+    return this.repo.listSubscriptionsForAccount(account.proxyAddress).flatMap((subscription) => {
+      const visibleActivities = activities.filter(
+        (activity) => activity.timestamp >= subscription.notifyFromTs
+      );
       if (!visibleActivities.length) return [];
-      return splitForTelegram(renderActivityAlert(resolvedAccount,visibleActivities),3900).map((text,index) => ({
-        chatId: subscription.telegramChatId, text,
-        contextJson: JSON.stringify({activities: index === 0 ? visibleActivities : [], timing})
-      }));
+      return splitForTelegram(renderActivityAlert(resolvedAccount, visibleActivities), 3900).map(
+        (text, index) => ({
+          chatId: subscription.telegramChatId,
+          text,
+          contextJson: JSON.stringify({ activities: index === 0 ? visibleActivities : [], timing })
+        })
+      );
     });
   }
 
@@ -324,32 +352,54 @@ export class PollScheduler {
       const byChat = new Map<number, OutboxRow[]>();
       for (const row of this.repo.listPendingAlerts(Date.now())) {
         const rows = byChat.get(row.chat_id) ?? [];
-        rows.push(row); byChat.set(row.chat_id,rows);
+        rows.push(row);
+        byChat.set(row.chat_id, rows);
       }
-      await runWithConcurrency(this.config.alertSendConcurrency,[...byChat.values()],async rows => {
+      await runWithConcurrency(this.config.alertSendConcurrency, [...byChat.values()], async (rows) => {
         for (const row of rows) {
           if (this.stopped) break;
-          const {activities: visibleActivities,timing} = JSON.parse(row.context_json) as {
-            activities: UserActivity[]; timing: {pollStartedAtMs:number;fetchCompletedAtMs:number}
+          const { activities: visibleActivities, timing } = JSON.parse(row.context_json) as {
+            activities: UserActivity[];
+            timing: { pollStartedAtMs: number; fetchCompletedAtMs: number };
           };
-          const account = {proxyAddress:row.proxy_address};
-          const subscription = {telegramChatId:row.chat_id};
+          const account = { proxyAddress: row.proxy_address };
+          const subscription = { telegramChatId: row.chat_id };
           if (!this.repo.claimAlert(row.id)) continue;
           const sendStartedAtMs = Date.now();
           try {
-            await this.deps.sendTelegram(row.chat_id,row.text);
-            this.repo.finishAlert(row.id,'DELIVERED');
+            await this.deps.sendTelegram(row.chat_id, row.text);
+            if (!this.repo.finishAlert(row.id, "DELIVERED")) {
+              this.deps.log(`[outbox:finish_conflict] outbox=${row.id}`);
+              continue;
+            }
           } catch (error) {
             const rejected = error instanceof TelegramRejectedError;
             const retry = rejected && error.code === 429;
-            this.repo.finishAlert(row.id,retry ? 'PENDING' : rejected ? 'REJECTED' : 'UNKNOWN',
+            const status = retry ? "PENDING" : rejected ? "REJECTED" : "UNKNOWN";
+            const updated = this.repo.finishAlert(
+              row.id,
+              status,
               error instanceof Error ? error.message : String(error),
-              retry ? Date.now() + Math.max(1000,error.retryAfterMs) : 0);
-            this.deps.log(`[alert:error] proxy=${row.proxy_address} chat=${row.chat_id} outbox=${row.id} status=${retry ? 'PENDING' : rejected ? 'REJECTED' : 'UNKNOWN'}`);
+              retry ? Date.now() + Math.max(1000, error.retryAfterMs) : 0
+            );
+            if (updated) {
+              this.deps.log(
+                `[alert:error] proxy=${row.proxy_address} chat=${row.chat_id} outbox=${row.id} outcome=${retry ? "RATE_LIMIT" : status}`
+              );
+            } else {
+              this.deps.log(`[outbox:finish_conflict] outbox=${row.id}`);
+            }
             continue;
           }
           const sendCompletedAtMs = Date.now();
-          this.recordDeliverySamples(account.proxyAddress, subscription.telegramChatId, visibleActivities, timing, sendStartedAtMs, sendCompletedAtMs);
+          this.recordDeliverySamples(
+            account.proxyAddress,
+            subscription.telegramChatId,
+            visibleActivities,
+            timing,
+            sendStartedAtMs,
+            sendCompletedAtMs
+          );
           alertsSent += 1;
         }
       });
@@ -365,19 +415,22 @@ export class PollScheduler {
     proxyAddress: string,
     chatId: number,
     visibleActivities: UserActivity[],
-    timing: {pollStartedAtMs: number; fetchCompletedAtMs: number},
+    timing: { pollStartedAtMs: number; fetchCompletedAtMs: number },
     sendStartedAtMs: number,
     sendCompletedAtMs: number
   ): void {
     const delayThresholdMs = this.config.alertDelayThresholdSec * 1000;
     const staleAgesMs = visibleActivities
-      .map((activity) => calculateDelayPhaseMetrics(
-        activity.timestamp,
-        timing.pollStartedAtMs,
-        timing.fetchCompletedAtMs,
-        timing.fetchCompletedAtMs,
-        timing.fetchCompletedAtMs
-      ).ageAtPollStartMs)
+      .map(
+        (activity) =>
+          calculateDelayPhaseMetrics(
+            activity.timestamp,
+            timing.pollStartedAtMs,
+            timing.fetchCompletedAtMs,
+            timing.fetchCompletedAtMs,
+            timing.fetchCompletedAtMs
+          ).ageAtPollStartMs
+      )
       .filter((ageAtPollStartMs) => ageAtPollStartMs >= delayThresholdMs);
 
     if (staleAgesMs.length > 0) {
@@ -465,7 +518,8 @@ export class PollScheduler {
     );
     const freshness = this.repo.getFreshnessStats();
     const nowSec = Math.floor(Date.now() / 1000);
-    const lagSec = freshness.newestSeenTimestamp > 0 ? Math.max(0, nowSec - freshness.newestSeenTimestamp) : 0;
+    const lagSec =
+      freshness.newestSeenTimestamp > 0 ? Math.max(0, nowSec - freshness.newestSeenTimestamp) : 0;
 
     this.repo.insertPollRun({
       kind: "heartbeat",

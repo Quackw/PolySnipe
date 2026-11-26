@@ -1,6 +1,12 @@
 import { getJson, getText } from "./http.js";
 import { SlidingWindowRateGate } from "../utils/rateGate.js";
-import type { ActivityPageResult, AppConfig, PublicProfile, ResolvedAccount, UserActivity } from "../types.js";
+import type {
+  ActivityPageResult,
+  AppConfig,
+  PublicProfile,
+  ResolvedAccount,
+  UserActivity
+} from "../types.js";
 import { buildActivityKey, filterAllowedActivities } from "../services/activity.js";
 import type { ParsedAccountInput } from "../subscriptionInput.js";
 
@@ -92,7 +98,10 @@ function activityNumber(value: unknown, field: string): number | undefined {
   if (value === undefined || value === null) {
     return undefined;
   }
-  if ((typeof value !== "number" && typeof value !== "string") || (typeof value === "string" && value.trim() === "")) {
+  if (
+    (typeof value !== "number" && typeof value !== "string") ||
+    (typeof value === "string" && value.trim() === "")
+  ) {
     throw new Error(`Invalid activity field: ${field}`);
   }
   const parsed = Number(value);
@@ -121,7 +130,13 @@ export function parseUserActivity(raw: unknown, version: "v1" | "v2"): UserActiv
     const type = activityString(item.type, "type")?.toUpperCase();
     const timestamp = activityNumber(item.timestamp, "timestamp");
 
-    if (!proxyWallet || !type || timestamp === undefined || !Number.isSafeInteger(timestamp) || timestamp < 0) {
+    if (
+      !proxyWallet ||
+      !type ||
+      timestamp === undefined ||
+      !Number.isSafeInteger(timestamp) ||
+      timestamp < 0
+    ) {
       throw new Error("Invalid activity identity or timestamp");
     }
 
@@ -146,7 +161,8 @@ export function parseUserActivity(raw: unknown, version: "v1" | "v2"): UserActiv
     };
     // v1 coerced explicit null amounts to zero in persisted watermark keys.
     // Preserve that identity only; unknown v2 amounts remain undefined for display.
-    activity.legacyActivityKey = buildActivityKey({ ...activity,
+    activity.legacyActivityKey = buildActivityKey({
+      ...activity,
       size: item.size === null ? 0 : activity.size,
       usdcSize: field("usdcSize", "usdc_size") === null ? 0 : activity.usdcSize
     });
@@ -182,7 +198,12 @@ export interface ResolveActivityHooks {
 
 export interface PolymarketClient {
   resolveAccountInput(input: ParsedAccountInput): Promise<ResolvedAccount>;
-  fetchRecentUserActivity(proxyAddress: string, startTs: number, endTs: number, hooks?: ResolveActivityHooks): Promise<ActivityPageResult>;
+  fetchRecentUserActivity(
+    proxyAddress: string,
+    startTs: number,
+    endTs: number,
+    hooks?: ResolveActivityHooks
+  ): Promise<ActivityPageResult>;
 }
 
 export class DefaultPolymarketClient implements PolymarketClient {
@@ -190,7 +211,11 @@ export class DefaultPolymarketClient implements PolymarketClient {
   private readonly gammaGate: SlidingWindowRateGate;
 
   public constructor(private readonly config: AppConfig) {
-    this.dataGate = new SlidingWindowRateGate(config.activitySafeRps * 10, 10_000, config.activityConcurrency);
+    this.dataGate = new SlidingWindowRateGate(
+      config.activitySafeRps * 10,
+      10_000,
+      config.activityConcurrency
+    );
     this.gammaGate = new SlidingWindowRateGate(100, 10_000, 5);
   }
 
@@ -277,8 +302,12 @@ export class DefaultPolymarketClient implements PolymarketClient {
         throw new Error("Oversized v2 activity page");
       }
       for (const row of activityPage.activities) {
-        if (row.proxyWallet !== proxyAddress.toLowerCase() || row.timestamp < startTs || row.timestamp > endTs ||
-            (out.length > 0 && row.timestamp > out[out.length - 1]!.timestamp)) {
+        if (
+          row.proxyWallet !== proxyAddress.toLowerCase() ||
+          row.timestamp < startTs ||
+          row.timestamp > endTs ||
+          (out.length > 0 && row.timestamp > out[out.length - 1]!.timestamp)
+        ) {
           throw new Error("V2 activity outside requested wallet/window/order");
         }
         out.push(row);
@@ -287,8 +316,8 @@ export class DefaultPolymarketClient implements PolymarketClient {
       const latest = allowed[0]?.timestamp;
       // Bootstrap sends no history. Stop only after the entire newest timestamp
       // group is covered (including across page boundaries), not after a row count.
-      const bootstrapCovered = hooks?.bootstrapOnly === true && latest !== undefined &&
-        out.some(row => row.timestamp < latest);
+      const bootstrapCovered =
+        hooks?.bootstrapOnly === true && latest !== undefined && out.some((row) => row.timestamp < latest);
 
       if (activityPage.nextCursor !== null && seenCursors.has(activityPage.nextCursor)) {
         throw new Error("Repeated v2 activity cursor; refusing partial poll");
@@ -296,7 +325,7 @@ export class DefaultPolymarketClient implements PolymarketClient {
       // Docs checked 2026-10-23: only explicit null means complete, even on empty/short pages.
       if (activityPage.nextCursor === null || bootstrapCovered) {
         const activities = allowed.sort((a, b) => b.timestamp - a.timestamp);
-        if (new Set(activities.filter(row => row.timestamp === latest).map(buildActivityKey)).size > 500) {
+        if (new Set(activities.filter((row) => row.timestamp === latest).map(buildActivityKey)).size > 500) {
           throw new Error("Activity timestamp exceeds persisted watermark capacity");
         }
         return { activities, apiCalls, retries, throttleWaitMs };

@@ -1,0 +1,18 @@
+[Unit]
+Description=PolySnipe V3 FAST sender and RTDS A receiver
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=POLYSNIPE_USER
+WorkingDirectory=/path/to/PolySnipe
+EnvironmentFile=/etc/polysnipe/fast.env
+ExecStart=/usr/bin/node components/holy-snipe-fast/fast.mjs
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=25
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

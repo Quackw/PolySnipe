@@ -73,9 +73,10 @@ export function loadConfig(): AppConfig {
   const telegramBotToken = required("TELEGRAM_BOT_TOKEN");
   const sqlitePath = required("SQLITE_PATH");
   const baseTimeoutMs = parsePositiveInt("HTTP_TIMEOUT_MS", DEFAULT_HTTP_TIMEOUT_MS);
-  const baseRetries = envValue("HTTP_RETRIES") === undefined
-    ? undefined
-    : parseNonNegativeInt("HTTP_RETRIES", DEFAULT_HTTP_RETRIES);
+  const baseRetries =
+    envValue("HTTP_RETRIES") === undefined
+      ? undefined
+      : parseNonNegativeInt("HTTP_RETRIES", DEFAULT_HTTP_RETRIES);
 
   return {
     telegramBotToken,

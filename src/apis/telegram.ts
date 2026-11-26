@@ -7,7 +7,10 @@ export interface TelegramSenderOptions {
 }
 
 export class TelegramRejectedError extends Error {
-  constructor(public readonly code: number, public readonly retryAfterMs = 0) {
+  constructor(
+    public readonly code: number,
+    public readonly retryAfterMs = 0
+  ) {
     super(`Telegram rejected send: ${code}`);
   }
 }
@@ -50,15 +53,34 @@ async function sendMessage(token: string, chatId: number, text: string, timeoutM
       })
     });
 
-    const body = await response.json() as {ok?:unknown; error_code?:unknown; parameters?:{retry_after?:unknown}; result?:{message_id?:unknown;chat?:{id?:unknown}}};
-    if (!response.ok && response.status === body?.error_code && body?.ok === false && typeof body.error_code === 'number' && body.error_code >= 400 && body.error_code < 500) {
+    const body = (await response.json()) as {
+      ok?: unknown;
+      error_code?: unknown;
+      parameters?: { retry_after?: unknown };
+      result?: { message_id?: unknown; chat?: { id?: unknown } };
+    };
+    if (
+      !response.ok &&
+      response.status === body?.error_code &&
+      body?.ok === false &&
+      typeof body.error_code === "number" &&
+      body.error_code >= 400 &&
+      body.error_code < 500
+    ) {
       const seconds = body.parameters?.retry_after;
-      throw new TelegramRejectedError(body.error_code,
-        typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 0 ? seconds*1000 : 30000);
+      throw new TelegramRejectedError(
+        body.error_code,
+        typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 30000
+      );
     }
-    if (!response.ok || body?.ok !== true || !Number.isSafeInteger(body.result?.message_id)
-      || Number(body.result?.message_id) <= 0 || String(body.result?.chat?.id) !== String(chatId)) {
-      throw new Error('Telegram acknowledgement missing or invalid');
+    if (
+      !response.ok ||
+      body?.ok !== true ||
+      !Number.isSafeInteger(body.result?.message_id) ||
+      Number(body.result?.message_id) <= 0 ||
+      String(body.result?.chat?.id) !== String(chatId)
+    ) {
+      throw new Error("Telegram acknowledgement missing or invalid");
     }
   } finally {
     clearTimeout(timeout);
