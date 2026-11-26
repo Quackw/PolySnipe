@@ -296,7 +296,7 @@ if (process.argv[2] === 'test-owner1') {
     JOIN tracked_accounts a ON a.proxy_address=s.proxy_address
     LEFT JOIN access_grants g ON g.telegram_user_id=u.telegram_user_id
     WHERE u.chat_type='private' AND u.telegram_chat_id=u.telegram_user_id
-      AND (g.telegram_user_id IS NOT NULL OR u.telegram_user_id IN (${ownerPlaceholders})))`);
+      AND (g.telegram_user_id IS NOT NULL OR u.telegram_user_id IN (${ownerPlaceholders}))`);
   const cancelSubscriptionDeliveries = createSubscriptionCancellation(db);
   const resilientMode = process.env.FAST_RTDS_RESILIENT === '1';
   let guardCurrentScope = null;
