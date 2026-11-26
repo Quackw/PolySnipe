@@ -549,6 +549,7 @@ if (process.argv[2] === 'test-owner1') {
       }
     });
   }
+  const telegramCircuit = createTelegramCircuit();
   const redeem = createRedeem(db, {
     config: JSON.parse(fs.readFileSync(path.join(ROOT, 'redeem-config.json'), 'utf8')),
     getRecipients: () => recipientMap,
@@ -558,7 +559,11 @@ if (process.argv[2] === 'test-owner1') {
       active &&
       !!enabledAt() &&
       !fs.existsSync(path.join(ROOT, 'REDEEM_DISABLED')),
-    telegram,
+    telegram: async (...args) => {
+      const result = await telegram(...args);
+      telegramCircuit.observe(result);
+      return result;
+    },
     freshEligibility: createRedeemEligibility({ activeSubscriptions, ownerIds, normalizeAddress }),
     onFatal: () => stopFast('REDEEM_RATE_GUARD_PERSISTENCE_FAILED')
   });
@@ -959,7 +964,6 @@ if (process.argv[2] === 'test-owner1') {
     });
     ws.addEventListener('close', () => reconnect(gen, 'close'));
   }
-  const telegramCircuit = createTelegramCircuit();
   const claimGuard = createDeliveryClaimGuard(db, {
     onClaimLost: (row) => {
       if (row.isRestRecovery) recovery.stop('RECOVERY_CLAIM_LOST');
@@ -1024,18 +1028,14 @@ if (process.argv[2] === 'test-owner1') {
   }
   async function sendDue() {
     if (sending || !claimGuard.flush() || !active || !telegramCircuit.ready()) return;
-    const row = claim(Date.now(), !!enabledAt());
-    if (!row) {
-      sending = true;
-      try {
-        await redeem.sendDue();
-      } finally {
-        sending = false;
-      }
-      return;
-    }
     sending = true;
+    let row;
     try {
+      row = claim(Date.now(), !!enabledAt());
+      if (!row) {
+        await redeem.sendDue();
+        return;
+      }
       await claimGuard.run(row, beforeTelegramRequest, requestTelegram, (result, settled) => {
         const now = Date.now();
         const messageId = result.value?.result?.message_id ?? null;
@@ -1141,10 +1141,13 @@ if (process.argv[2] === 'test-owner1') {
           );
       });
     } catch (e) {
+      if (!row) throw e;
       trace.delivery(row, 'SEND_EXCEPTION', { reason: 'SEND_WORKER_EXCEPTION' });
       if (row.isRestRecovery) recovery.stop('RECOVERY_SEND_WORKER_ERROR');
       else throw e;
     } finally {
+      // A tick can acquire the probe and have no eligible request to send.
+      telegramCircuit.releaseProbe();
       sending = false;
     }
   }

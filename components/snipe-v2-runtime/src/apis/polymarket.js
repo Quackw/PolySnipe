@@ -207,30 +207,24 @@ export class DefaultPolymarketClient {
         });
         return { data, waitMs };
     }
-    async getGammaJson(url) {
-        const ticket = await this.gammaGate.acquire();
-        try {
-            const data = await getJson(url, {
-                timeoutMs: this.config.polymarketTimeoutMs,
-                retries: this.config.polymarketRetries
-            });
-            return { data, waitMs: ticket.waitMs };
-        }
-        finally {
-            ticket.release();
-        }
+    getGammaJson(url) {
+        return this.getGamma(url, getJson);
     }
-    async getGammaText(url) {
-        const ticket = await this.gammaGate.acquire();
-        try {
-            const data = await getText(url, {
-                timeoutMs: this.config.polymarketTimeoutMs,
-                retries: this.config.polymarketRetries
-            });
-            return { data, waitMs: ticket.waitMs };
-        }
-        finally {
-            ticket.release();
-        }
+    getGammaText(url) {
+        return this.getGamma(url, getText);
+    }
+    async getGamma(url, request) {
+        let waitMs = 0;
+        const data = await request(url, {
+            timeoutMs: this.config.polymarketTimeoutMs,
+            retries: this.config.polymarketRetries,
+            beforeAttempt: async () => {
+                const ticket = await this.gammaGate.acquire();
+                waitMs += ticket.waitMs;
+                return ticket.release;
+            },
+            onRateLimit: (delayMs) => this.gammaGate.pauseFor(delayMs)
+        });
+        return { data, waitMs };
     }
 }

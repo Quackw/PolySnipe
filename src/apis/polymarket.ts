@@ -1,4 +1,4 @@
-import { getJson, getText } from "./http.js";
+import { getJson, getText, type RequestOptions } from "./http.js";
 import { SlidingWindowRateGate } from "../utils/rateGate.js";
 import type {
   ActivityPageResult,
@@ -111,6 +111,30 @@ function activityNumber(value: unknown, field: string): number | undefined {
   return parsed;
 }
 
+function parseActivityTimestamp(value: unknown): number | undefined {
+  let timestamp: number;
+  if (typeof value === "number") {
+    timestamp = value;
+  } else if (typeof value === "string" && value.trim() !== "") {
+    timestamp = Number(value);
+    if (Number.isNaN(timestamp)) {
+      timestamp = Math.floor(Date.parse(value) / 1000);
+    }
+  } else {
+    return undefined;
+  }
+
+  if (!Number.isSafeInteger(timestamp) || timestamp <= 0) return undefined;
+  return timestamp >= 1_000_000_000_000 ? Math.floor(timestamp / 1000) : timestamp;
+}
+
+function parseActivitySide(value: unknown): UserActivity["side"] {
+  const side = activityString(value, "side")?.trim().toUpperCase();
+  if (!side) return undefined;
+  if (side === "BUY" || side === "SELL") return side;
+  throw new Error("Invalid activity field: side");
+}
+
 // Normalize v2 to the existing identity fields so persisted v1 watermark keys still match.
 // The v1 mode is only for compatibility fixtures; live requests require the v2 envelope.
 export function parseUserActivity(raw: unknown, version: "v1" | "v2"): UserActivity[] {
@@ -128,15 +152,9 @@ export function parseUserActivity(raw: unknown, version: "v1" | "v2"): UserActiv
     const field = (v1: string, v2: string): unknown => item[version === "v1" ? v1 : v2];
     const proxyWallet = activityString(field("proxyWallet", "proxy_wallet"), "proxy_wallet")?.toLowerCase();
     const type = activityString(item.type, "type")?.toUpperCase();
-    const timestamp = activityNumber(item.timestamp, "timestamp");
+    const timestamp = parseActivityTimestamp(item.timestamp);
 
-    if (
-      !proxyWallet ||
-      !type ||
-      timestamp === undefined ||
-      !Number.isSafeInteger(timestamp) ||
-      timestamp < 0
-    ) {
+    if (!proxyWallet || !type || timestamp === undefined) {
       throw new Error("Invalid activity identity or timestamp");
     }
 
@@ -147,7 +165,7 @@ export function parseUserActivity(raw: unknown, version: "v1" | "v2"): UserActiv
       conditionId: activityString(field("conditionId", "condition_id"), "condition_id")?.toLowerCase(),
       transactionHash: activityString(field("transactionHash", "transaction_hash"), "transaction_hash"),
       asset: activityString(field("asset", "token_id"), "token_id"),
-      side: activityString(item.side, "side")?.toUpperCase(),
+      side: parseActivitySide(item.side),
       size: activityNumber(item.size, "size"),
       usdcSize: activityNumber(field("usdcSize", "usdc_size"), "usdc_size"),
       price: activityNumber(item.price, "price"),
@@ -181,6 +199,7 @@ function parseActivityPage(raw: unknown): { activities: UserActivity[]; nextCurs
     throw new Error("Missing v2 activity pagination");
   }
   const pagination = page.pagination as Record<string, unknown>;
+  // Only an explicit null marks the final page. A missing cursor is incomplete.
   const nextCursor = pagination.next_cursor;
   if (nextCursor !== null && (typeof nextCursor !== "string" || nextCursor.trim() === "")) {
     throw new Error("Invalid or missing v2 activity next_cursor");
@@ -374,29 +393,29 @@ export class DefaultPolymarketClient implements PolymarketClient {
     return { data, waitMs };
   }
 
-  private async getGammaJson<T>(url: string): Promise<{ data: T; waitMs: number }> {
-    const ticket = await this.gammaGate.acquire();
-    try {
-      const data = await getJson<T>(url, {
-        timeoutMs: this.config.polymarketTimeoutMs,
-        retries: this.config.polymarketRetries
-      });
-      return { data, waitMs: ticket.waitMs };
-    } finally {
-      ticket.release();
-    }
+  private getGammaJson<T>(url: string): Promise<{ data: T; waitMs: number }> {
+    return this.getGamma(url, getJson<T>);
   }
 
-  private async getGammaText(url: string): Promise<{ data: string; waitMs: number }> {
-    const ticket = await this.gammaGate.acquire();
-    try {
-      const data = await getText(url, {
-        timeoutMs: this.config.polymarketTimeoutMs,
-        retries: this.config.polymarketRetries
-      });
-      return { data, waitMs: ticket.waitMs };
-    } finally {
-      ticket.release();
-    }
+  private getGammaText(url: string): Promise<{ data: string; waitMs: number }> {
+    return this.getGamma(url, getText);
+  }
+
+  private async getGamma<T>(
+    url: string,
+    request: (url: string, options: RequestOptions) => Promise<T>
+  ): Promise<{ data: T; waitMs: number }> {
+    let waitMs = 0;
+    const data = await request(url, {
+      timeoutMs: this.config.polymarketTimeoutMs,
+      retries: this.config.polymarketRetries,
+      beforeAttempt: async () => {
+        const ticket = await this.gammaGate.acquire();
+        waitMs += ticket.waitMs;
+        return ticket.release;
+      },
+      onRateLimit: (delayMs) => this.gammaGate.pauseFor(delayMs)
+    });
+    return { data, waitMs };
   }
 }

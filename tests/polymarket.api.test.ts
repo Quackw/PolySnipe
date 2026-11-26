@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DefaultPolymarketClient, parseUserActivity } from "../src/apis/polymarket.js";
 import { buildActivityKey, updateWatermarkState } from "../src/services/activity.js";
+import { SlidingWindowRateGate } from "../src/utils/rateGate.js";
 import { testConfig } from "./helpers.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("DefaultPolymarketClient", () => {
@@ -32,6 +34,66 @@ describe("DefaultPolymarketClient", () => {
     expect(fetchMock.mock.calls.length).toBeGreaterThan(0);
     const firstCall = fetchMock.mock.calls[0] as unknown[] | undefined;
     expect(String(firstCall?.[0])).toContain("/public-search?");
+  });
+
+  it("acquires a Gamma ticket per JSON attempt and pauses on 429", async () => {
+    vi.useFakeTimers();
+    const acquire = vi.spyOn(SlidingWindowRateGate.prototype, "acquire");
+    const pause = vi.spyOn(SlidingWindowRateGate.prototype, "pauseFor");
+    const { client, fetchMock } = clientWith(
+      [
+        new Response(null, { status: 429, headers: { "Retry-After": "2" } }),
+        { profiles: [{ name: "fixture", proxyWallet: wallet }] }
+      ],
+      { polymarketRetries: 1 }
+    );
+
+    const request = client.resolveAccountInput({ kind: "profile_slug", slug: "fixture" });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(acquire).toHaveBeenCalledTimes(1);
+    expect(pause).toHaveBeenCalledExactlyOnceWith(2000);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(request).resolves.toMatchObject({ proxyAddress: wallet });
+    expect(acquire).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("acquires a Gamma ticket per profile page attempt and pauses on 429", async () => {
+    vi.useFakeTimers();
+    const acquire = vi.spyOn(SlidingWindowRateGate.prototype, "acquire");
+    const pause = vi.spyOn(SlidingWindowRateGate.prototype, "pauseFor");
+    const urlPaths: string[] = [];
+    const responses = [
+      new Response('{"profiles":[]}'),
+      new Response(null, { status: 429, headers: { "Retry-After": "2" } }),
+      new Response(`<script>{"proxyAddress":"${wallet}"}</script>`),
+      new Response(JSON.stringify({ proxyWallet: wallet, name: "fixture" }))
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        urlPaths.push(new URL(url).pathname);
+        return responses.shift();
+      })
+    );
+    const client = new DefaultPolymarketClient(testConfig("/tmp/test.db", { polymarketRetries: 1 }));
+
+    const request = client.resolveAccountInput({ kind: "profile_slug", slug: "fixture" });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(urlPaths).toEqual(["/public-search", "/@fixture"]);
+    expect(acquire).toHaveBeenCalledTimes(2);
+    expect(pause).toHaveBeenCalledExactlyOnceWith(2000);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(request).resolves.toMatchObject({ proxyAddress: wallet });
+    expect(urlPaths).toEqual(["/public-search", "/@fixture", "/@fixture", "/public-profile"]);
+    expect(acquire).toHaveBeenCalledTimes(4);
+  });
+
+  it("returns null for a missing public profile after exactly one request", async () => {
+    const { client, fetchMock } = clientWith([new Response(null, { status: 404 })], { polymarketRetries: 3 });
+    await expect(client["fetchPublicProfile"](wallet)).resolves.toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 const wallet = "0xabc";
@@ -117,6 +179,14 @@ describe("activity v2 contract", () => {
     const b = clientWith([page([row()], "a")], { activityMaxPages: 1 });
     await expect(b.client.fetchRecentUserActivity(wallet, 100, 200)).rejects.toThrow(/budget/);
   });
+  it("rejects a missing terminal cursor after a valid page", async () => {
+    const { client, fetchMock } = clientWith([
+      page([row()], "a"),
+      { data: [], pagination: { has_more: false } }
+    ]);
+    await expect(client.fetchRecentUserActivity(wallet, 100, 200)).rejects.toThrow(/next_cursor/);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
   it.each([
     new Error("network"),
     new Response("{}", { status: 503 }),
@@ -161,6 +231,37 @@ describe("activity v2 contract", () => {
     expect(updateWatermarkState(old, [normalized, normalized]).newActivities).toEqual([]);
     const changed = parseUserActivity([row(120, { token_id: "124", size: null, usdc_size: null })], "v2");
     expect(updateWatermarkState(old, changed).newActivities).toHaveLength(1);
+  });
+});
+
+describe("activity normalization", () => {
+  it.each([1_700_000_000, "1700000000", 1_700_000_000_123, "1700000000123", "2023-11-14T22:13:20Z"])(
+    "normalizes %s to epoch seconds with the same activity key",
+    (timestamp) => {
+      const [activity] = parseUserActivity([row(120, { timestamp })], "v2");
+      const [expected] = parseUserActivity([row(1_700_000_000)], "v2");
+      expect(activity?.timestamp).toBe(1_700_000_000);
+      expect(activity?.legacyActivityKey).toBe(expected?.legacyActivityKey);
+    }
+  );
+
+  it.each([0, -1, "0", "-1", "  ", 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid timestamp %s",
+    (timestamp) => {
+      expect(() => parseUserActivity([row(120, { timestamp })], "v2")).toThrow(/timestamp/);
+    }
+  );
+
+  it("normalizes trade sides and accepts an absent side for non-trade activity", () => {
+    const activities = parseUserActivity(
+      [row(120, { side: "buy" }), row(119, { side: " Sell " }), row(118, { type: "MERGE", side: "" })],
+      "v2"
+    );
+    expect(activities.map((activity) => activity.side)).toEqual(["BUY", "SELL", undefined]);
+  });
+
+  it.each(["HOLD", 1])("rejects an invalid side %s", (side) => {
+    expect(() => parseUserActivity([row(120, { side })], "v2")).toThrow(/side/);
   });
 });
 
