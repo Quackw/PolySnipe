@@ -22,6 +22,15 @@ import type {
 export const MAX_ALERT_ATTEMPTS = 10;
 const ATTEMPTS_EXHAUSTED = "Delivery attempt limit reached";
 
+type AlertStatus = "DELIVERED" | "UNKNOWN" | "REJECTED" | "PENDING";
+
+type AlertCompletion = {
+  status: AlertStatus;
+  error?: string | null;
+  nextAttemptMs?: number;
+  pruneAfterPermanentRejects?: number;
+};
+
 export type OutboxInsert = { chatId: number; text: string; contextJson: string };
 export type OutboxRow = {
   id: number;
@@ -46,9 +55,11 @@ type TrackedAccountRow = {
   profile_slug: string | null;
   last_seen_timestamp: number;
   last_seen_keys_json: string;
+  skip_activity_through_timestamp: number;
   last_polled_at_ms: number | null;
   next_poll_at_ms: number;
   consecutive_errors: number;
+  consecutive_page_budget_exhaustions: number;
   inflight: number;
   inflight_started_at_ms: number | null;
 };
@@ -142,9 +153,11 @@ function mapTrackedAccount(row: TrackedAccountRow): TrackedAccountRecord {
     profileSlug: row.profile_slug ?? undefined,
     lastSeenTimestamp: row.last_seen_timestamp,
     lastSeenKeys: parseKeysJson(row.last_seen_keys_json),
+    skipActivityThroughTimestamp: row.skip_activity_through_timestamp,
     lastPolledAtMs: row.last_polled_at_ms ?? undefined,
     nextPollAtMs: row.next_poll_at_ms,
     consecutiveErrors: row.consecutive_errors,
+    consecutivePageBudgetExhaustions: row.consecutive_page_budget_exhaustions,
     inflight: row.inflight === 1,
     inflightStartedAtMs: row.inflight_started_at_ms ?? undefined
   };
@@ -352,9 +365,11 @@ export class AppRepository {
             profile_slug,
             last_seen_timestamp,
             last_seen_keys_json,
+            skip_activity_through_timestamp,
             last_polled_at_ms,
             next_poll_at_ms,
             consecutive_errors,
+            consecutive_page_budget_exhaustions,
             inflight,
             inflight_started_at_ms
           FROM tracked_accounts
@@ -374,22 +389,28 @@ export class AppRepository {
     createdByUserId: number,
     notifyFromTs: number
   ): { created: boolean } {
-    const result = this.db
-      .prepare(
-        `
-          INSERT OR IGNORE INTO subscriptions (
-            subscriber_id,
-            telegram_chat_id,
-            proxy_address,
-            created_by_user_id,
-            notify_from_ts
+    return this.db
+      .transaction(() => {
+        const result = this.db
+          .prepare(
+            `
+            INSERT OR IGNORE INTO subscriptions (
+              subscriber_id,
+              telegram_chat_id,
+              proxy_address,
+              created_by_user_id,
+              notify_from_ts
+            )
+            VALUES (?, ?, ?, ?, ?)
+          `
           )
-          VALUES (?, ?, ?, ?, ?)
-        `
-      )
-      .run(subscriberId, chatId, proxyAddress.toLowerCase(), createdByUserId, notifyFromTs);
+          .run(subscriberId, chatId, proxyAddress.toLowerCase(), createdByUserId, notifyFromTs);
 
-    return { created: result.changes > 0 };
+        const created = result.changes > 0;
+        if (created) this.clearChatUnavailableStreak(chatId);
+        return { created };
+      })
+      .immediate();
   }
 
   public listChatSubscriptions(chatId: number): ChatSubscriptionView[] {
@@ -726,6 +747,7 @@ export class AppRepository {
         )
         .run(safeChatId, safeProxyAddress).changes;
 
+      if (removedSubscriptions > 0) this.clearChatUnavailableStreak(safeChatId);
       const removedTrackedAccounts =
         removedSubscriptions > 0 ? this.cleanupTrackedAccountIfOrphaned(safeProxyAddress) : 0;
       return { removedSubscriptions, removedTrackedAccounts };
@@ -750,6 +772,7 @@ export class AppRepository {
         .all(safeChatId) as Array<{ proxy_address: string }>;
 
       this.cancelPendingSubscriptions(safeChatId);
+      this.clearChatUnavailableStreak(safeChatId);
       const removedSubscriptions = this.db
         .prepare(
           `
@@ -768,6 +791,10 @@ export class AppRepository {
     });
 
     return tx.immediate(chatId);
+  }
+
+  private clearChatUnavailableStreak(chatId: number): void {
+    this.db.prepare("DELETE FROM chat_unavailable_streaks WHERE chat_id=?").run(chatId);
   }
 
   private cancelPendingSubscriptions(chatId: number, proxyAddress: string | null = null): void {
@@ -853,9 +880,11 @@ export class AppRepository {
             profile_slug,
             last_seen_timestamp,
             last_seen_keys_json,
+            skip_activity_through_timestamp,
             last_polled_at_ms,
             next_poll_at_ms,
             consecutive_errors,
+            consecutive_page_budget_exhaustions,
             inflight,
             inflight_started_at_ms
           FROM tracked_accounts
@@ -895,49 +924,66 @@ export class AppRepository {
     lastPolledAtMs: number;
     nextPollAtMs: number;
     alerts?: OutboxInsert[];
-  }): void {
-    this.db
+    claimStartedAtMs?: number;
+    fastForward?: boolean;
+  }): boolean {
+    return this.db
       .transaction(() => {
-        this.db
-          .prepare(
-            `
+        const proxyAddress = payload.proxyAddress.toLowerCase();
+        const updated = this.db
+          .prepare(`
             UPDATE tracked_accounts
             SET
-              last_seen_timestamp = ?,
-              last_seen_keys_json = ?,
-              last_polled_at_ms = ?,
-              next_poll_at_ms = ?,
+              last_seen_timestamp = @timestamp,
+              last_seen_keys_json = @keys,
+              skip_activity_through_timestamp = MAX(skip_activity_through_timestamp, @skipThrough),
+              last_polled_at_ms = @lastPolledAtMs,
+              next_poll_at_ms = @nextPollAtMs,
               consecutive_errors = 0,
+              consecutive_page_budget_exhaustions = 0,
               inflight = 0,
               inflight_started_at_ms = NULL,
               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE proxy_address = ?
-          `
-          )
-          .run(
-            payload.lastSeenTimestamp,
-            JSON.stringify(payload.lastSeenKeys),
-            payload.lastPolledAtMs,
-            payload.nextPollAtMs,
-            payload.proxyAddress.toLowerCase()
-          );
-        for (const alert of payload.alerts ?? []) {
+            WHERE proxy_address = @proxyAddress
+              AND (@claim IS NULL OR (inflight = 1 AND inflight_started_at_ms = @claim))
+          `)
+          .run({
+            proxyAddress,
+            timestamp: payload.lastSeenTimestamp,
+            keys: JSON.stringify(payload.lastSeenKeys),
+            skipThrough: payload.fastForward ? payload.lastSeenTimestamp : 0,
+            lastPolledAtMs: payload.lastPolledAtMs,
+            nextPollAtMs: payload.nextPollAtMs,
+            claim: payload.claimStartedAtMs ?? null
+          });
+        if (updated.changes !== 1) return false;
+
+        for (const alert of payload.fastForward ? [] : (payload.alerts ?? [])) {
           this.db
             .prepare(`INSERT INTO alert_outbox(subscription_id,proxy_address,chat_id,text,context_json)
           SELECT id,proxy_address,telegram_chat_id,?,? FROM subscriptions
           WHERE proxy_address=? AND telegram_chat_id=?`)
-            .run(alert.text, alert.contextJson, payload.proxyAddress.toLowerCase(), alert.chatId);
+            .run(alert.text, alert.contextJson, proxyAddress, alert.chatId);
         }
+        return true;
       })
       .immediate();
   }
 
   public recoverOutbox(): number {
     return this.db
-      .prepare(
-        "UPDATE alert_outbox SET status='UNKNOWN',last_error='Process stopped during send' WHERE status='SENDING'"
-      )
-      .run().changes;
+      .transaction(() => {
+        this.db
+          .prepare(`DELETE FROM chat_unavailable_streaks WHERE chat_id IN (
+        SELECT chat_id FROM alert_outbox WHERE status='SENDING')`)
+          .run();
+        return this.db
+          .prepare(
+            "UPDATE alert_outbox SET status='UNKNOWN',last_error='Process stopped during send' WHERE status='SENDING'"
+          )
+          .run().changes;
+      })
+      .immediate();
   }
 
   public listPendingAlerts(nowMs: number, limit = 100): OutboxRow[] {
@@ -956,26 +1002,60 @@ export class AppRepository {
 
   public finishAlert(
     id: number,
-    status: "DELIVERED" | "UNKNOWN" | "REJECTED" | "PENDING",
+    status: AlertStatus,
     error: string | null = null,
     nextAttemptMs = 0
   ): boolean {
-    const result = this.db
-      .prepare(`UPDATE alert_outbox SET
-      status=CASE WHEN @status='PENDING' AND attempts>=@maxAttempts THEN 'REJECTED' ELSE @status END,
-      last_error=CASE WHEN @status='PENDING' AND attempts>=@maxAttempts THEN @exhausted ELSE @error END,
-      next_attempt_ms=CASE WHEN @status='PENDING' AND attempts<@maxAttempts THEN @nextAttemptMs ELSE 0 END,
-      updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE id=@id AND status='SENDING'`)
-      .run({
-        id,
-        status,
-        error,
-        nextAttemptMs,
-        maxAttempts: MAX_ALERT_ATTEMPTS,
-        exhausted: ATTEMPTS_EXHAUSTED
-      });
-    return result.changes === 1;
+    return this.settleAlert(id, { status, error, nextAttemptMs }).updated;
+  }
+
+  public settleAlert(
+    id: number,
+    completion: AlertCompletion
+  ): {
+    updated: boolean;
+    removedSubscriptions: number;
+  } {
+    const { status, error = null, nextAttemptMs = 0, pruneAfterPermanentRejects = 0 } = completion;
+    return this.db
+      .transaction(() => {
+        const row = this.db
+          .prepare(`UPDATE alert_outbox SET
+          status=CASE WHEN @status='PENDING' AND attempts>=@maxAttempts THEN 'REJECTED' ELSE @status END,
+          last_error=CASE WHEN @status='PENDING' AND attempts>=@maxAttempts THEN @exhausted ELSE @error END,
+          next_attempt_ms=CASE WHEN @status='PENDING' AND attempts<@maxAttempts THEN @nextAttemptMs ELSE 0 END,
+          updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id=@id AND status='SENDING'
+          RETURNING chat_id, subscription_id`)
+          .get({
+            id,
+            status,
+            error,
+            nextAttemptMs,
+            maxAttempts: MAX_ALERT_ATTEMPTS,
+            exhausted: ATTEMPTS_EXHAUSTED
+          }) as { chat_id: number; subscription_id: number } | undefined;
+        if (!row) return { updated: false, removedSubscriptions: 0 };
+
+        if (status !== "REJECTED" || pruneAfterPermanentRejects === 0) {
+          this.clearChatUnavailableStreak(row.chat_id);
+          return { updated: true, removedSubscriptions: 0 };
+        }
+
+        // A rejection from a subscription removed during the send cannot prune a new subscription.
+        const streak = this.db
+          .prepare(`INSERT INTO chat_unavailable_streaks(chat_id, consecutive_rejects)
+          SELECT telegram_chat_id, 1 FROM subscriptions WHERE id=? AND telegram_chat_id=?
+          ON CONFLICT(chat_id) DO UPDATE SET consecutive_rejects=consecutive_rejects+1
+          RETURNING consecutive_rejects`)
+          .get(row.subscription_id, row.chat_id) as { consecutive_rejects: number } | undefined;
+        const removedSubscriptions =
+          streak && streak.consecutive_rejects >= pruneAfterPermanentRejects
+            ? this.removeAllSubscriptions(row.chat_id).removedSubscriptions
+            : 0;
+        return { updated: true, removedSubscriptions };
+      })
+      .immediate();
   }
 
   public outboxCounts(): Record<string, number> {
@@ -989,21 +1069,33 @@ export class AppRepository {
     );
   }
 
-  public markPollFailure(proxyAddress: string, nextPollAtMs: number, consecutiveErrors: number): void {
-    this.db
-      .prepare(
-        `
-          UPDATE tracked_accounts
-          SET
-            next_poll_at_ms = ?,
-            consecutive_errors = ?,
-            inflight = 0,
-            inflight_started_at_ms = NULL,
-            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-          WHERE proxy_address = ?
-        `
-      )
-      .run(nextPollAtMs, consecutiveErrors, proxyAddress.toLowerCase());
+  public markPollFailure(
+    proxyAddress: string,
+    nextPollAtMs: number,
+    consecutiveErrors: number,
+    options: { claimStartedAtMs?: number; consecutivePageBudgetExhaustions?: number } = {}
+  ): boolean {
+    const updated = this.db
+      .prepare(`
+        UPDATE tracked_accounts
+        SET
+          next_poll_at_ms = @nextPollAtMs,
+          consecutive_errors = @consecutiveErrors,
+          consecutive_page_budget_exhaustions = @budgetExhaustions,
+          inflight = 0,
+          inflight_started_at_ms = NULL,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE proxy_address = @proxyAddress
+          AND (@claim IS NULL OR (inflight = 1 AND inflight_started_at_ms = @claim))
+      `)
+      .run({
+        nextPollAtMs,
+        consecutiveErrors,
+        proxyAddress: proxyAddress.toLowerCase(),
+        budgetExhaustions: options.consecutivePageBudgetExhaustions ?? 0,
+        claim: options.claimStartedAtMs ?? null
+      });
+    return updated.changes === 1;
   }
 
   public clearStaleInflight(nowMs: number, staleAfterMs: number): number {

@@ -10,6 +10,10 @@ V1 stores subscriptions, checkpoints and alert delivery state in SQLite. Preserv
 
 Polymarket GETs retry network failures, timeouts, HTTP 408, 429 and 5xx, and malformed JSON. Each attempt acquires its own rate-limit slot. A 429 pauses the shared gate even when that request has exhausted its retry budget. Local backoff is capped at 30 seconds. A valid HTTP `Retry-After` can extend that to 60 seconds.
 
+V1 skips an exhausted activity window after `V1_PAGE_BUDGET_RESYNC_AFTER` consecutive page-budget or watermark-capacity failures for a wallet. The default is 3. Set 0 to disable this behavior. The first validated page supplies the new checkpoint. Recovery resumes after the entire checkpoint second, including any fills with that timestamp on unread pages. The skipped window produces zero new outbox entries. Missing or older first-page checkpoints retain the usual retry behavior.
+
+`PRUNE_BLOCKED_CHAT_AFTER_REJECTS` defaults to 3. V1 removes a chat's subscriptions after consecutive Telegram-confirmed blocks, deactivations, kicks, or `chat not found` rejections. Any other delivery outcome breaks the streak. The same transaction finalizes the rejection, removes the subscriptions, and cancels their pending alerts. Set 0 to keep automatic removal disabled.
+
 ## FAST and B
 
 Use `pnpm run test:components` to exercise the receive workers, shared sender and bridge with temporary data. It makes no requests to Telegram or Polymarket.

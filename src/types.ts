@@ -25,6 +25,7 @@ export interface AppConfig {
   activityPageLimit: number;
   activityMaxPages: number;
   activityOverlapSec: number;
+  pageBudgetResyncAfter: number;
   rebalanceEveryMs: number;
   orphanCleanupEveryMs: number;
   subscribeModeTtlMs: number;
@@ -34,6 +35,7 @@ export interface AppConfig {
   heartbeatEveryMs: number;
   alertDelayThresholdSec: number;
   alertSendConcurrency: number;
+  pruneBlockedChatAfterRejects: number;
   pollRunsRetentionHours: number;
   polymarketTimeoutMs: number;
   polymarketRetries: number;
@@ -64,9 +66,11 @@ export interface TrackedAccountRecord {
   profileSlug?: string | undefined;
   lastSeenTimestamp: number;
   lastSeenKeys: string[];
+  skipActivityThroughTimestamp: number;
   lastPolledAtMs?: number | undefined;
   nextPollAtMs: number;
   consecutiveErrors: number;
+  consecutivePageBudgetExhaustions: number;
   inflight: boolean;
   inflightStartedAtMs?: number | undefined;
 }

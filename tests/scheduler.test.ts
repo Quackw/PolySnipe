@@ -2,7 +2,11 @@ import { AppRepository } from "../src/db/repository.js";
 import { openDb } from "../src/db/client.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PollScheduler, calculateEffectiveIntervalMs, computeRetryDelayMs } from "../src/scheduler.js";
-import { DefaultPolymarketClient, type PolymarketClient } from "../src/apis/polymarket.js";
+import {
+  DefaultPolymarketClient,
+  type PolymarketClient,
+  V2ActivityPageBudgetExhaustedError
+} from "../src/apis/polymarket.js";
 import { createTempRepo, testConfig } from "./helpers.js";
 
 const resources: Array<ReturnType<typeof createTempRepo>> = [];
@@ -761,4 +765,243 @@ it("v2 duplicate rows and reopening the saved database do not resend an acknowle
     first.stop();
     vi.unstubAllGlobals();
   }
+});
+
+describe("V1 activity resync", () => {
+  const wallet = "0x" + "1".repeat(40);
+  const previousWatermark = 110;
+  const latest = 120;
+  const row = (timestamp: number, transaction_hash: string) => ({
+    proxy_wallet: wallet,
+    timestamp,
+    type: "TRADE",
+    transaction_hash
+  });
+  const page = (data: ReturnType<typeof row>[], cursor: string | null) =>
+    Response.json({ data, pagination: { next_cursor: cursor, has_more: cursor !== null } });
+
+  function fixture() {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(200_000));
+    const t = setupRepo();
+    const { repo } = t;
+    const sub = repo.upsertSubscriber(1, 100, "private");
+    repo.upsertTrackedAccount({ proxyAddress: wallet, nextPollAtMs: 0 });
+    repo.createSubscription(sub, 100, wallet, 1, 0);
+    repo.markPollSuccess({
+      proxyAddress: wallet,
+      lastSeenTimestamp: previousWatermark,
+      lastSeenKeys: ["legacy-key"],
+      lastPolledAtMs: 1,
+      nextPollAtMs: 0
+    });
+    return {
+      ...t,
+      tracked: () => repo.getTrackedAccount(wallet)!,
+      async nextPoll() {
+        const due = repo.getTrackedAccount(wallet)!.nextPollAtMs;
+        await vi.advanceTimersByTimeAsync(Math.max(0, due - Date.now()) + 20);
+      }
+    };
+  }
+
+  it.each(["pages", "watermark keys"])(
+    "resyncs on the third %s failure and sends only activity after the entire checkpoint second",
+    async (limit) => {
+      const { repo, dbPath, tracked, nextPoll } = fixture();
+      const headRows = Array.from({ length: 500 }, (_, i) => row(latest, "fixture-head-" + i));
+      const unseenSameSecond = row(latest, "fixture-unseen-same-second");
+      const oldActivity = row(latest - 1, "fixture-old");
+      const fresh = row(latest + 1, "fixture-fresh");
+      const fetchMock = vi.fn(async (url: string) => {
+        const params = new URL(url).searchParams;
+        const start = Number(params.get("start"));
+        if (start > previousWatermark) {
+          expect(start).toBe(latest + 1);
+          return page(
+            [fresh, unseenSameSecond, oldActivity].filter((activity) => activity.timestamp >= start),
+            null
+          );
+        }
+
+        if (limit === "pages") return page([headRows[0]!, oldActivity], "continue");
+        return params.has("cursor") ? page([unseenSameSecond], null) : page(headRows, "continue");
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const config = testConfig(dbPath, {
+        activityPageLimit: 500,
+        activityMaxPages: limit === "pages" ? 1 : 2
+      });
+      const logs: string[] = [];
+      const sent = vi.fn(async () => {});
+      const client = new DefaultPolymarketClient(config);
+      const deps = { sendTelegram: sent, log: (line: string) => logs.push(line) };
+      const scheduler = new PollScheduler(config, repo, client, deps);
+      scheduler.start();
+      try {
+        await vi.advanceTimersByTimeAsync(20);
+        expect(tracked()).toMatchObject({
+          lastSeenTimestamp: previousWatermark,
+          lastSeenKeys: ["legacy-key"],
+          consecutivePageBudgetExhaustions: 1
+        });
+        await nextPoll();
+        expect(tracked()).toMatchObject({
+          lastSeenTimestamp: previousWatermark,
+          lastSeenKeys: ["legacy-key"],
+          consecutivePageBudgetExhaustions: 2
+        });
+        await nextPoll();
+        expect(tracked()).toMatchObject({
+          lastSeenTimestamp: latest,
+          skipActivityThroughTimestamp: latest,
+          consecutiveErrors: 0,
+          consecutivePageBudgetExhaustions: 0
+        });
+        expect(tracked().lastSeenKeys).toHaveLength(limit === "pages" ? 1 : 500);
+        expect(repo.outboxCounts()).toEqual({});
+        expect(sent).not.toHaveBeenCalled();
+        expect(fetchMock).toHaveBeenCalledTimes(limit === "pages" ? 3 : 6);
+        const resync = logs.find((line) => line.startsWith("[poll:resync] "))!;
+        expect(JSON.parse(resync.slice("[poll:resync] ".length))).toEqual({
+          wallet,
+          consecutiveExhaustions: 3,
+          previousWatermark,
+          newWatermark: latest,
+          reason: "page_budget_fast_forward"
+        });
+
+        await scheduler.stopAndDrain();
+        const reopened = new AppRepository(openDb(dbPath));
+        const resumed = new PollScheduler(config, reopened, client, deps);
+        try {
+          expect(reopened.getTrackedAccount(wallet)?.skipActivityThroughTimestamp).toBe(latest);
+          resumed.start();
+          await nextPoll();
+          expect(reopened.outboxCounts()).toEqual({ DELIVERED: 1 });
+          expect(reopened.getTrackedAccount(wallet)).toMatchObject({
+            lastSeenTimestamp: latest + 1,
+            consecutivePageBudgetExhaustions: 0
+          });
+          expect(reopened.getAdminPerformanceReport(Date.now()).sampleCount).toBe(1);
+          expect(sent).toHaveBeenCalledTimes(1);
+        } finally {
+          await resumed.stopAndDrain();
+          reopened.close();
+        }
+      } finally {
+        await scheduler.stopAndDrain();
+        vi.unstubAllGlobals();
+      }
+    }
+  );
+
+  it.each(["disabled", "missing head", "older head"])(
+    "keeps the checkpoint when resync is %s",
+    async (mode) => {
+      const { repo, dbPath, tracked, nextPoll } = fixture();
+      const head =
+        mode === "missing head"
+          ? null
+          : { timestamp: mode === "older head" ? previousWatermark - 1 : latest, keys: [] };
+      const fetchRecentUserActivity = vi.fn().mockRejectedValue(new V2ActivityPageBudgetExhaustedError(head));
+      const config = testConfig(dbPath, mode === "disabled" ? { pageBudgetResyncAfter: 0 } : {});
+      const scheduler = new PollScheduler(
+        config,
+        repo,
+        { resolveAccountInput: vi.fn(), fetchRecentUserActivity },
+        { sendTelegram: vi.fn(), log: () => {} }
+      );
+      scheduler.start();
+      try {
+        await vi.advanceTimersByTimeAsync(20);
+        for (let i = 0; i < 3; i += 1) await nextPoll();
+        expect(fetchRecentUserActivity).toHaveBeenCalledTimes(4);
+        expect(tracked()).toMatchObject({
+          lastSeenTimestamp: previousWatermark,
+          lastSeenKeys: ["legacy-key"],
+          skipActivityThroughTimestamp: 0
+        });
+        expect(repo.outboxCounts()).toEqual({});
+      } finally {
+        await scheduler.stopAndDrain();
+      }
+    }
+  );
+
+  it.each(["successful poll", "different failure"])(
+    "breaks a page exhaustion streak after a %s",
+    async (kind) => {
+      const { repo, dbPath, tracked, nextPoll } = fixture();
+      const budgetError = new V2ActivityPageBudgetExhaustedError({ timestamp: latest, keys: [] });
+      const fetchRecentUserActivity = vi
+        .fn()
+        .mockRejectedValueOnce(budgetError)
+        .mockRejectedValueOnce(budgetError);
+      if (kind === "successful poll") {
+        fetchRecentUserActivity.mockResolvedValueOnce({
+          activities: [],
+          apiCalls: 1,
+          retries: 0,
+          throttleWaitMs: 0
+        });
+      } else {
+        fetchRecentUserActivity.mockRejectedValueOnce(new Error("Repeated v2 activity cursor"));
+      }
+      fetchRecentUserActivity.mockRejectedValueOnce(budgetError);
+      const scheduler = new PollScheduler(
+        testConfig(dbPath),
+        repo,
+        { resolveAccountInput: vi.fn(), fetchRecentUserActivity },
+        { sendTelegram: vi.fn(), log: () => {} }
+      );
+      scheduler.start();
+      try {
+        await vi.advanceTimersByTimeAsync(20);
+        await nextPoll();
+        expect(tracked().consecutivePageBudgetExhaustions).toBe(2);
+        await nextPoll();
+        expect(tracked().consecutivePageBudgetExhaustions).toBe(0);
+        await nextPoll();
+        expect(tracked()).toMatchObject({
+          lastSeenTimestamp: previousWatermark,
+          consecutivePageBudgetExhaustions: 1
+        });
+        expect(repo.outboxCounts()).toEqual({});
+      } finally {
+        await scheduler.stopAndDrain();
+      }
+    }
+  );
+});
+
+it("fences a delayed checkpoint or resync after the wallet has been claimed again", () => {
+  const { repo } = setupRepo();
+  const wallet = "0x" + "a".repeat(40);
+  repo.upsertTrackedAccount({ proxyAddress: wallet, nextPollAtMs: 0 });
+  expect(repo.tryClaimTrackedAccount(wallet, 100)).toBe(true);
+  expect(repo.clearStaleInflight(250, 100)).toBe(1);
+  expect(repo.tryClaimTrackedAccount(wallet, 250)).toBe(true);
+
+  const result = {
+    proxyAddress: wallet,
+    lastSeenTimestamp: 20,
+    lastSeenKeys: ["head"],
+    lastPolledAtMs: 300,
+    nextPollAtMs: 1000
+  };
+  expect(repo.markPollSuccess({ ...result, claimStartedAtMs: 100, fastForward: true })).toBe(false);
+  expect(repo.markPollFailure(wallet, 1000, 1, { claimStartedAtMs: 100 })).toBe(false);
+  expect(repo.getTrackedAccount(wallet)).toMatchObject({
+    lastSeenTimestamp: 0,
+    inflightStartedAtMs: 250,
+    inflight: true
+  });
+  expect(repo.markPollSuccess({ ...result, claimStartedAtMs: 250, fastForward: true })).toBe(true);
+  expect(repo.getTrackedAccount(wallet)).toMatchObject({
+    lastSeenTimestamp: 20,
+    skipActivityThroughTimestamp: 20,
+    inflight: false
+  });
+  expect(repo.outboxCounts()).toEqual({});
 });

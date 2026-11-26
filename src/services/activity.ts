@@ -11,7 +11,7 @@ export const ALLOWED_ACTIVITY_TYPES = new Set([
   "REFERRAL_REWARD"
 ]);
 
-const MAX_WATERMARK_KEYS = 500;
+export const MAX_WATERMARK_KEYS = 500;
 
 function unique<T>(values: readonly T[]): T[] {
   return [...new Set(values)];

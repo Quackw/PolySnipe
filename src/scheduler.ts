@@ -1,5 +1,5 @@
 import { splitForTelegram } from "./utils/telegram.js";
-import { TelegramRejectedError } from "./apis/telegram.js";
+import { isPermanentChatUnavailableError, TelegramRejectedError } from "./apis/telegram.js";
 import type { OutboxInsert, OutboxRow } from "./db/repository.js";
 import { renderActivityAlert } from "./services/format.js";
 import { updateWatermarkState } from "./services/activity.js";
@@ -14,7 +14,7 @@ import type {
   UserActivity
 } from "./types.js";
 import type { AppRepository } from "./db/repository.js";
-import type { PolymarketClient } from "./apis/polymarket.js";
+import { type PolymarketClient, V2ActivityPageBudgetExhaustedError } from "./apis/polymarket.js";
 
 type DelayPhaseMetrics = {
   ageAtPollStartMs: number;
@@ -199,7 +199,7 @@ export class PollScheduler {
 
           startedAny = true;
           this.activePolls += 1;
-          void this.pollAccount(account.proxyAddress).finally(() => {
+          void this.pollAccount(account.proxyAddress, nowMs).finally(() => {
             this.activePolls = Math.max(0, this.activePolls - 1);
           });
         }
@@ -213,10 +213,10 @@ export class PollScheduler {
     }
   }
 
-  private async pollAccount(proxyAddress: string): Promise<void> {
+  private async pollAccount(proxyAddress: string, claimStartedAtMs: number): Promise<void> {
     const startedAt = Date.now();
     const tracked = this.repo.getTrackedAccount(proxyAddress);
-    if (!tracked) {
+    if (!tracked || tracked.inflightStartedAtMs !== claimStartedAtMs) {
       return;
     }
 
@@ -228,13 +228,20 @@ export class PollScheduler {
     );
 
     const nowSec = Math.floor(Date.now() / 1000);
-    const startTs = Math.max(0, tracked.lastSeenTimestamp - this.config.activityOverlapSec);
+    // The cutoff includes the entire head second, including keys beyond the first page.
+    const startTs = Math.max(
+      tracked.skipActivityThroughTimestamp > 0 ? tracked.skipActivityThroughTimestamp + 1 : 0,
+      tracked.lastSeenTimestamp - this.config.activityOverlapSec
+    );
     const pollStartedAtMs = Date.now();
 
     try {
-      const activityResult = await this.polymarket.fetchRecentUserActivity(proxyAddress, startTs, nowSec, {
-        bootstrapOnly: tracked.lastSeenTimestamp === 0 && tracked.lastSeenKeys.length === 0
-      });
+      const activityResult =
+        startTs > nowSec
+          ? { activities: [], apiCalls: 0, retries: 0, throttleWaitMs: 0 }
+          : await this.polymarket.fetchRecentUserActivity(proxyAddress, startTs, nowSec, {
+              bootstrapOnly: tracked.lastSeenTimestamp === 0 && tracked.lastSeenKeys.length === 0
+            });
       const watermark = updateWatermarkState(
         {
           initialized: tracked.lastSeenTimestamp > 0 || tracked.lastSeenKeys.length > 0,
@@ -246,8 +253,9 @@ export class PollScheduler {
       const fetchCompletedAtMs = Date.now();
 
       const nextPollAtMs = Date.now() + effectiveIntervalMs;
-      this.repo.markPollSuccess({
+      const updated = this.repo.markPollSuccess({
         proxyAddress,
+        claimStartedAtMs,
         lastSeenTimestamp: watermark.nextState.lastSeenTimestamp,
         lastSeenKeys: watermark.nextState.lastSeenKeys,
         lastPolledAtMs: Date.now(),
@@ -256,6 +264,7 @@ export class PollScheduler {
           ? []
           : this.prepareAlerts(tracked, watermark.newActivities, { pollStartedAtMs, fetchCompletedAtMs })
       });
+      if (!updated) return;
 
       if (!watermark.bootstrap && process.env.HOLY_DESK_EXPORT_MODULE) {
         try {
@@ -293,9 +302,42 @@ export class PollScheduler {
         );
       }
     } catch (error) {
+      const threshold = this.config.pageBudgetResyncAfter;
+      const budgetError = error instanceof V2ActivityPageBudgetExhaustedError ? error : null;
+      const consecutiveExhaustions =
+        threshold > 0 && budgetError
+          ? Math.min(Number.MAX_SAFE_INTEGER, tracked.consecutivePageBudgetExhaustions + 1)
+          : 0;
+      const head = budgetError?.head;
+      const fastForwardHead =
+        threshold > 0 &&
+        consecutiveExhaustions >= threshold &&
+        head &&
+        Number.isSafeInteger(head.timestamp) &&
+        head.timestamp > tracked.skipActivityThroughTimestamp &&
+        head.timestamp >= tracked.lastSeenTimestamp &&
+        head.timestamp <= nowSec
+          ? head
+          : null;
+      const nowMs = Date.now();
       const consecutiveErrors = tracked.consecutiveErrors + 1;
       const delayMs = computeRetryDelayMs(consecutiveErrors);
-      this.repo.markPollFailure(proxyAddress, Date.now() + delayMs, consecutiveErrors);
+      const updated = fastForwardHead
+        ? this.repo.markPollSuccess({
+            proxyAddress,
+            claimStartedAtMs,
+            fastForward: true,
+            lastSeenTimestamp: fastForwardHead.timestamp,
+            lastSeenKeys: fastForwardHead.keys,
+            lastPolledAtMs: nowMs,
+            nextPollAtMs: nowMs + effectiveIntervalMs
+          })
+        : this.repo.markPollFailure(proxyAddress, nowMs + delayMs, consecutiveErrors, {
+            claimStartedAtMs,
+            consecutivePageBudgetExhaustions: consecutiveExhaustions
+          });
+      if (!updated) return;
+
       this.repo.insertPollRun({
         kind: "account",
         proxyAddress,
@@ -313,7 +355,20 @@ export class PollScheduler {
         throttleWaitMs: 0,
         note: error instanceof Error ? error.message : String(error)
       });
-      this.deps.log(`[poll:error] proxy=${proxyAddress} delay_ms=${delayMs} error=${String(error)}`);
+      if (fastForwardHead) {
+        this.deps.log(
+          "[poll:resync] " +
+            JSON.stringify({
+              wallet: proxyAddress,
+              consecutiveExhaustions,
+              previousWatermark: tracked.lastSeenTimestamp,
+              newWatermark: fastForwardHead.timestamp,
+              reason: "page_budget_fast_forward"
+            })
+        );
+      } else {
+        this.deps.log(`[poll:error] proxy=${proxyAddress} delay_ms=${delayMs} error=${String(error)}`);
+      }
     }
   }
 
@@ -376,13 +431,25 @@ export class PollScheduler {
             const rejected = error instanceof TelegramRejectedError;
             const retry = rejected && error.code === 429;
             const status = retry ? "PENDING" : rejected ? "REJECTED" : "UNKNOWN";
-            const updated = this.repo.finishAlert(
-              row.id,
+            const { updated, removedSubscriptions } = this.repo.settleAlert(row.id, {
               status,
-              error instanceof Error ? error.message : String(error),
-              retry ? Date.now() + Math.max(1000, error.retryAfterMs) : 0
-            );
+              error: error instanceof Error ? error.message : String(error),
+              nextAttemptMs: retry ? Date.now() + Math.max(1000, error.retryAfterMs) : 0,
+              pruneAfterPermanentRejects: isPermanentChatUnavailableError(error)
+                ? this.config.pruneBlockedChatAfterRejects
+                : 0
+            });
             if (updated) {
+              if (removedSubscriptions > 0) {
+                this.deps.log(
+                  "[alert:prune_chat] " +
+                    JSON.stringify({
+                      chatId: row.chat_id,
+                      removedCount: removedSubscriptions,
+                      reason: "telegram_chat_permanently_unavailable"
+                    })
+                );
+              }
               this.deps.log(
                 `[alert:error] proxy=${row.proxy_address} chat=${row.chat_id} outbox=${row.id} outcome=${retry ? "RATE_LIMIT" : status}`
               );

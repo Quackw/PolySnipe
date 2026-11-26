@@ -3,7 +3,11 @@ import { createTempRepo, testConfig } from "./helpers.js";
 import { openDb } from "../src/db/client.js";
 import { AppRepository, MAX_ALERT_ATTEMPTS } from "../src/db/repository.js";
 import { PollScheduler } from "../src/scheduler.js";
-import { createTelegramSender, TelegramRejectedError } from "../src/apis/telegram.js";
+import {
+  createTelegramSender,
+  isPermanentChatUnavailableError,
+  TelegramRejectedError
+} from "../src/apis/telegram.js";
 import type { PolymarketClient } from "../src/apis/polymarket.js";
 const resources: ReturnType<typeof createTempRepo>[] = [];
 afterEach(() => {
@@ -385,4 +389,219 @@ it("adds the subscription index to a populated database and handles an already e
   } finally {
     reopened.close();
   }
+});
+
+describe("permanently unavailable Telegram chats", () => {
+  const blocked = () => new TelegramRejectedError(403, 0, "Forbidden: bot was blocked by the user");
+
+  it.each([
+    [403, "Forbidden: bot was blocked by the user"],
+    [403, "Forbidden: user is deactivated"],
+    [403, "Forbidden: bot was kicked from the supergroup chat"],
+    [403, "Forbidden: bot was kicked from the channel"],
+    [400, "Bad Request: chat not found"]
+  ])("recognizes Telegram %i %s", async (status, description) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ ok: false, error_code: status, description }, { status }))
+    );
+    const sender = createTelegramSender({ token: "test", timeoutMs: 100, log: () => {} });
+    const error = await sender(10, "fixture").catch((failure) => failure);
+    expect(error).toBeInstanceOf(TelegramRejectedError);
+    expect(isPermanentChatUnavailableError(error)).toBe(true);
+  });
+
+  it.each([
+    new TelegramRejectedError(429, 1000, "bot was blocked by the user"),
+    new TelegramRejectedError(500, 0, "bot was blocked by the user"),
+    new TelegramRejectedError(403, 0, "Forbidden"),
+    new TelegramRejectedError(403, 0, "Forbidden: not enough rights to send text messages to the chat"),
+    new TelegramRejectedError(400, 0, "Bad Request: can't parse entities"),
+    new TelegramRejectedError(400, 0, "Bad Request: message is too long"),
+    new Error("ECONNRESET"),
+    new Error("Forbidden: bot was blocked by the user")
+  ])("preserves subscriptions on ambiguous or non-matching errors (%s)", (error) => {
+    expect(isPermanentChatUnavailableError(error)).toBe(false);
+  });
+
+  it("requires a matching Telegram rejection body before treating a chat as unavailable", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json(
+          { ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" },
+          {
+            status: 500
+          }
+        )
+      )
+    );
+    const sender = createTelegramSender({ token: "test", timeoutMs: 100, log: () => {} });
+    const error = await sender(10, "fixture").catch((failure) => failure);
+    expect(error).toBeInstanceOf(Error);
+    expect(isPermanentChatUnavailableError(error)).toBe(false);
+  });
+
+  function queue(repo: AppRepository, proxyAddress: string, alerts: (typeof alert)[]) {
+    repo.markPollSuccess({
+      proxyAddress,
+      lastSeenTimestamp: 123,
+      lastSeenKeys: ["key"],
+      lastPolledAtMs: 1,
+      nextPollAtMs: 9999999999999,
+      alerts
+    });
+  }
+
+  it("prunes only the rejected chat on the third definitive rejection and cancels its pending work", async () => {
+    vi.useFakeTimers();
+    const { repo, dbPath } = setup();
+    const other = repo.upsertSubscriber(2, 20, "private");
+    repo.createSubscription(other, 20, "wallet", 2, 0);
+    repo.upsertTrackedAccount({ proxyAddress: "second-wallet", nextPollAtMs: 0 });
+    const owner = repo.upsertSubscriber(1, 10, "private");
+    repo.createSubscription(owner, 10, "second-wallet", 1, 0);
+    queue(repo, "wallet", [alert, alert, alert, alert, { ...alert, chatId: 20 }]);
+    queue(repo, "second-wallet", [alert]);
+
+    const sendTelegram = vi.fn(async (chatId: number) => {
+      if (chatId === 10) throw blocked();
+    });
+    const log = vi.fn();
+    const scheduler = new PollScheduler(testConfig(dbPath), repo, brokenClient, { sendTelegram, log });
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(100);
+    await scheduler.stopAndDrain();
+
+    expect(sendTelegram.mock.calls.filter(([chatId]) => chatId === 10)).toHaveLength(3);
+    expect(repo.listChatSubscriptions(10)).toEqual([]);
+    expect(repo.listChatSubscriptions(20)).toHaveLength(1);
+    expect(repo.getTrackedAccount("wallet")).not.toBeNull();
+    expect(repo.getTrackedAccount("second-wallet")).toBeNull();
+    expect(repo.outboxCounts()).toEqual({ REJECTED: 3, CANCELLED: 2, DELIVERED: 1 });
+    expect(log).toHaveBeenCalledWith(
+      '[alert:prune_chat] {"chatId":10,"removedCount":2,"reason":"telegram_chat_permanently_unavailable"}'
+    );
+  });
+
+  it.each([
+    ["success", null],
+    ["429", new TelegramRejectedError(429, 1000)],
+    ["5xx", new Error("Telegram acknowledgement missing or invalid")],
+    ["network error", new Error("connection reset")]
+  ])("breaks the permanent rejection streak on %s", async (_label, interruption) => {
+    vi.useFakeTimers();
+    const { repo, dbPath } = setup();
+    queue(repo, "wallet", [alert, alert, alert, alert, alert]);
+    const sendTelegram = vi.fn().mockRejectedValueOnce(blocked()).mockRejectedValueOnce(blocked());
+    if (interruption) sendTelegram.mockRejectedValueOnce(interruption);
+    else sendTelegram.mockResolvedValueOnce(undefined);
+    sendTelegram.mockRejectedValueOnce(blocked()).mockRejectedValueOnce(blocked());
+    sendTelegram.mockResolvedValue(undefined);
+    const scheduler = new PollScheduler(testConfig(dbPath), repo, brokenClient, {
+      sendTelegram,
+      log: () => {}
+    });
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(2000);
+    await scheduler.stopAndDrain();
+    expect(sendTelegram.mock.calls.length).toBeGreaterThanOrEqual(5);
+    expect(repo.listChatSubscriptions(10)).toHaveLength(1);
+    expect(repo.outboxCounts().REJECTED).toBe(4);
+  });
+
+  it("keeps subscriptions when automatic removal is configured off", async () => {
+    vi.useFakeTimers();
+    const { repo, dbPath } = setup();
+    queue(repo, "wallet", [alert, alert, alert, alert]);
+    const scheduler = new PollScheduler(
+      testConfig(dbPath, { pruneBlockedChatAfterRejects: 0 }),
+      repo,
+      brokenClient,
+      {
+        sendTelegram: vi.fn().mockRejectedValue(blocked()),
+        log: () => {}
+      }
+    );
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(100);
+    await scheduler.stopAndDrain();
+    expect(repo.listChatSubscriptions(10)).toHaveLength(1);
+    expect(repo.outboxCounts()).toEqual({ REJECTED: 4 });
+  });
+
+  it("keeps a new subscription when an in-flight send from its predecessor is rejected", () => {
+    const { repo } = setup();
+    admit(repo);
+    const [prior] = repo.listPendingAlerts(Date.now());
+    expect(repo.claimAlert(prior!.id)).toBe(true);
+    repo.removeAllSubscriptions(10);
+    repo.upsertTrackedAccount({ proxyAddress: "wallet", nextPollAtMs: 0 });
+    repo.createSubscription(repo.upsertSubscriber(1, 10, "private"), 10, "wallet", 1, 0);
+    expect(repo.settleAlert(prior!.id, { status: "REJECTED", pruneAfterPermanentRejects: 1 })).toEqual({
+      updated: true,
+      removedSubscriptions: 0
+    });
+    expect(repo.listChatSubscriptions(10)).toHaveLength(1);
+    expect(repo.outboxCounts()).toEqual({ REJECTED: 1 });
+  });
+
+  it("adds the policy state to a legacy database while preserving its checkpoint and outbox", () => {
+    const { repo, dbPath } = setup();
+    admit(repo);
+    const [prior] = repo.listPendingAlerts(Date.now());
+    expect(repo.claimAlert(prior!.id)).toBe(true);
+    expect(repo.recoverOutbox()).toBe(1);
+    admit(repo);
+
+    const oldDb = openDb(dbPath);
+    try {
+      oldDb.exec(
+        "DROP TABLE chat_unavailable_streaks; " +
+          "ALTER TABLE tracked_accounts DROP COLUMN skip_activity_through_timestamp; " +
+          "ALTER TABLE tracked_accounts DROP COLUMN consecutive_page_budget_exhaustions"
+      );
+    } finally {
+      oldDb.close();
+    }
+    const migrated = new AppRepository(openDb(dbPath));
+    try {
+      expect(migrated.getTrackedAccount("wallet")).toMatchObject({
+        lastSeenTimestamp: 123,
+        lastSeenKeys: ["key"],
+        skipActivityThroughTimestamp: 0,
+        consecutivePageBudgetExhaustions: 0
+      });
+      expect(migrated.listChatSubscriptions(10)).toHaveLength(1);
+      expect(migrated.outboxCounts()).toEqual({ UNKNOWN: 1, PENDING: 1 });
+      expect(migrated.listPendingAlerts(Date.now()).map(({ id }) => id)).not.toContain(prior!.id);
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it("fences an interrupted send and clears the persisted rejection streak on restart", () => {
+    const { repo, dbPath } = setup();
+    queue(repo, "wallet", [alert, alert, alert, alert]);
+    const permanent = { status: "REJECTED", pruneAfterPermanentRejects: 3 } as const;
+    for (let i = 0; i < 2; i += 1) {
+      const [head] = repo.listPendingAlerts(Date.now());
+      expect(repo.claimAlert(head!.id)).toBe(true);
+      expect(repo.settleAlert(head!.id, permanent).removedSubscriptions).toBe(0);
+    }
+    const [interrupted] = repo.listPendingAlerts(Date.now());
+    expect(repo.claimAlert(interrupted!.id)).toBe(true);
+    const reopened = new AppRepository(openDb(dbPath));
+    try {
+      expect(reopened.recoverOutbox()).toBe(1);
+      const [next] = reopened.listPendingAlerts(Date.now());
+      expect(next?.id).not.toBe(interrupted!.id);
+      expect(reopened.claimAlert(next!.id)).toBe(true);
+      expect(reopened.settleAlert(next!.id, permanent).removedSubscriptions).toBe(0);
+      expect(reopened.listChatSubscriptions(10)).toHaveLength(1);
+      expect(reopened.outboxCounts()).toEqual({ REJECTED: 3, UNKNOWN: 1 });
+    } finally {
+      reopened.close();
+    }
+  });
 });
