@@ -148,8 +148,13 @@ export class BufferedRtdsSocket {
     if (this.failed) return;
     this.failed = FRAME_FAILURES.has(reason) ? reason : 'WORKER_PROTOCOL_ERROR';
     this.markGap(this.failed);
-    this.emit('error', { reason: this.failed, buffer_protocol: 'A_BUFFER_V1' });
-    this.close();
+    // Account for frames now. The worker may still be waiting for its native socket to close.
+    this.discardPending(this.failed);
+    try {
+      this.emit('error', { reason: this.failed, buffer_protocol: 'A_BUFFER_V1' });
+    } finally {
+      this.close();
+    }
   }
   receive(row) {
     if (this.exited || !row || typeof row.kind !== 'string') return;
@@ -228,7 +233,6 @@ export class BufferedRtdsSocket {
         this.fail('FRAME_QUEUE_TIMEOUT');
         return;
       }
-      meta.started = true;
       this.stats.max_queue_wait_ms = Math.max(this.stats.max_queue_wait_ms, age);
       let settled = false;
       const complete = (status, reason) => {
@@ -267,6 +271,7 @@ export class BufferedRtdsSocket {
           this.fail('PIPELINE_RECEIPT_MISSING');
           return;
         }
+        meta.started = true;
         this.emit('message', {
           data: row.data,
           receipt_id: this.id + ':' + row.seq,
@@ -315,7 +320,9 @@ export class BufferedRtdsSocket {
         safe = safeSocketError({ name: v.error_class, code: v.error_code });
       this.diag({
         kind: 'A_NATIVE_SIGNAL',
-        signal: ['PING', 'PONG', 'SOCKET_ERROR', 'NATIVE_SOCKET_ERROR'].includes(v.kind) ? v.kind : 'OTHER',
+        signal: ['PING', 'PONG', 'SOCKET_ERROR', 'NATIVE_SOCKET_ERROR', 'NATIVE_CLOSE_ERROR'].includes(v.kind)
+          ? v.kind
+          : 'OTHER',
         ...safe
       });
     }

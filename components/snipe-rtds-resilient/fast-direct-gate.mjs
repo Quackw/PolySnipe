@@ -49,6 +49,24 @@ export function createDirectAdmissionGate({
    AND f.wallet=d.wallet AND f.source_timestamp=d.source_timestamp AND d.source_timestamp*1000<f.before_ms)`
       : ''
   } LIMIT 1`);
+  const priorAction = db.prepare(
+    'SELECT identity_json,first_event_key,first_trace_id FROM send_once_actions WHERE action_key=? AND chat_id=?'
+  );
+  const claimDelivery = db.prepare(
+    'SELECT wallet,source_timestamp,state FROM deliveries WHERE event_key=? AND chat_id=?'
+  );
+  const sendingDelivery = db.prepare(
+    'SELECT wallet,source_timestamp,state,claim_token FROM deliveries WHERE event_key=? AND chat_id=?'
+  );
+  const reservedAction = db.prepare(
+    'SELECT identity_json FROM send_once_actions WHERE first_event_key=? AND chat_id=?'
+  );
+  function requireReservation(row) {
+    const prior = reservedAction.get(row.event_key, row.chat_id);
+    const identity = prior ? JSON.parse(prior.identity_json) : null;
+    if (!Array.isArray(identity) || identity.length === 0 || identity[0] !== row.wallet)
+      throw Error('ACTION_RESERVATION_REQUIRED');
+  }
   const admit = function (trade, recipient, fillKey, traceId, html, nextAt, seenAt) {
     const started = mono();
     let begun = false,
@@ -74,9 +92,7 @@ export function createDirectAdmissionGate({
         return { kind: 'BLOCKED', reason: 'BEFORE_EXISTING_PROTECTION_BOUNDARY' };
       }
       const key = userActionKey(trade),
-        prior = db
-          .prepare('SELECT * FROM send_once_actions WHERE action_key=? AND chat_id=?')
-          .get(key, recipient);
+        prior = priorAction.get(key, recipient);
       if (prior) {
         if (prior.identity_json !== userActionIdentity(trade)) throw Error('IDENTITY_CONFLICT');
         // All existing states, including UNKNOWN and orphan reservations, suppress.
@@ -142,20 +158,12 @@ export function createDirectAdmissionGate({
       const before = boundary?.get(row.wallet, row.chat_id)?.before_ms;
       if (before != null && row.source_timestamp * 1000 < before)
         return { allow: false, reason: 'BEFORE_EXISTING_PROTECTION_BOUNDARY' };
-      const delivery = db
-        .prepare('SELECT wallet,source_timestamp,state FROM deliveries WHERE event_key=? AND chat_id=?')
-        .get(row.event_key, row.chat_id);
+      const delivery = claimDelivery.get(row.event_key, row.chat_id);
       if (!delivery || delivery.wallet !== row.wallet || delivery.source_timestamp !== row.source_timestamp)
         throw Error('CLAIM_DELIVERY_MISMATCH');
       if (!['PENDING', 'FAILED_RETRYABLE'].includes(delivery.state))
         return { allow: false, reason: 'DELIVERY_NOT_SENDABLE' };
-      const prior = db
-        .prepare(
-          'SELECT identity_json,first_event_key FROM send_once_actions WHERE first_event_key=? AND chat_id=?'
-        )
-        .get(row.event_key, row.chat_id);
-      if (!prior || JSON.parse(prior.identity_json)[0] !== row.wallet)
-        throw Error('ACTION_RESERVATION_REQUIRED');
+      requireReservation(row);
       return { allow: true, state_age_ms: age(started) };
     } catch (error) {
       disable('RTDS_DIRECT_CLAIM_SAFETY_STOP');
@@ -181,11 +189,7 @@ export function createDirectAdmissionGate({
       const before = boundary?.get(row.wallet, row.chat_id)?.before_ms;
       if (before != null && row.source_timestamp * 1000 < before)
         throw Error('BEFORE_EXISTING_PROTECTION_BOUNDARY');
-      const delivery = db
-        .prepare(
-          'SELECT wallet,source_timestamp,state,claim_token FROM deliveries WHERE event_key=? AND chat_id=?'
-        )
-        .get(row.event_key, row.chat_id);
+      const delivery = sendingDelivery.get(row.event_key, row.chat_id);
       if (
         !delivery ||
         delivery.wallet !== row.wallet ||
@@ -195,11 +199,7 @@ export function createDirectAdmissionGate({
         delivery.claim_token !== row.claimToken
       )
         throw Error('CURRENT_SEND_CLAIM_REQUIRED');
-      const action = db
-        .prepare('SELECT identity_json FROM send_once_actions WHERE first_event_key=? AND chat_id=?')
-        .get(row.event_key, row.chat_id);
-      if (!action || JSON.parse(action.identity_json)[0] !== row.wallet)
-        throw Error('ACTION_RESERVATION_REQUIRED');
+      requireReservation(row);
       // A normal unsubscribe is not a global safety failure. The caller must
       // cancel this exact claimed row and must never send it or release its
       // reservation; changed claims and stale checks still fail closed above.

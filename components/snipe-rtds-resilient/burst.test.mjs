@@ -170,18 +170,73 @@ test('default byte budget bounds sustained large bursts and reports every accept
     await f.s.terminate();
   }
 });
-test('pipeline exceptions are reported without false receipts or private exception text', async () => {
-  const f = await socket();
-  f.s.addEventListener('message', () => {
-    throw Error('private-token-or-address');
+for (const [listener, reason, unknown] of [
+  [null, 'PIPELINE_RECEIPT_MISSING', 0],
+  [
+    () => {
+      throw Error('private-token-or-address');
+    },
+    'PIPELINE_HANDLER_THROW',
+    1
+  ]
+])
+  test(`pipeline failure ${reason} accounts for the frame before a hung close finishes`, async () => {
+    const f = await socket();
+    let failure;
+    if (listener) f.s.addEventListener('message', listener);
+    f.s.addEventListener('error', () => {
+      failure ??= f.s.snapshot();
+    });
+    try {
+      f.s.send(command({ fixture: 'HANG_CLOSE' }));
+      f.s.send(command({ fixture: 'BURST', count: 65 }));
+      await until(() => failure, 'PIPELINE_FAILURE_MISSING');
+      assert.equal(f.s.exited, false);
+      assert.equal(failure.pending, 0);
+      assert.equal(failure.pipeline_completed, 0);
+      assert.equal(failure.unknown, unknown);
+      assert.equal(failure.accepted_accounted, true);
+      await until(() => {
+        const worker = f.s.snapshot().worker;
+        return worker?.accepted === 65 && worker.ended && worker.pending === 0;
+      }, 'WORKER_FRAME_STILL_PENDING');
+      assert.equal(f.s.snapshot().worker.receipted, 0);
+      assert.equal(f.dispositions.length, 65);
+      assert.ok(f.diagnostics.some((x) => x.reason === reason));
+      assert.ok(!JSON.stringify(f.diagnostics).includes('private-token-or-address'));
+    } finally {
+      await f.s.terminate();
+    }
   });
+
+test('native error without a close event exits after the receipt deadline', async () => {
+  const f = await socket({ limits: { ackTimeoutMs: 75 } });
+  f.s.addEventListener('message', () => {});
   try {
-    f.s.send(command({ fixture: 'BURST', count: 65 }));
-    await f.s.exit;
-    assert.equal(f.s.snapshot().pipeline_completed, 0);
-    assert.equal(f.s.snapshot().accepted_accounted, true);
-    assert.ok(f.diagnostics.some((x) => x.reason === 'PIPELINE_HANDLER_THROW'));
-    assert.ok(!JSON.stringify(f.diagnostics).includes('private-token-or-address'));
+    f.s.send(command({ fixture: 'BURST', count: 1 }));
+    f.s.send(command({ fixture: 'NATIVE_ERROR_WITHOUT_CLOSE' }));
+    await until(() => f.s.exited, 'WORKER_STUCK_AFTER_RECEIPT_TIMEOUT');
+    const s = f.s.snapshot();
+    assert.equal(s.last_error, 'FRAME_RECEIPT_TIMEOUT');
+    assert.equal(s.unknown, 1);
+    assert.equal(s.pending, 0);
+    assert.equal(s.accepted_accounted, true);
+  } finally {
+    await f.s.terminate();
+  }
+});
+
+test('buffered native close exception is reported and the worker exits cleanly', async () => {
+  const f = await socket();
+  try {
+    const errors = [];
+    f.s.worker.on('error', (error) => errors.push(error));
+    f.s.send(command({ fixture: 'THROW_ON_CLOSE' }));
+    f.s.close();
+    await until(() => f.s.exited, 'WORKER_STUCK_AFTER_CLOSE_EXCEPTION');
+    assert.deepEqual(errors, []);
+    assert.ok(f.diagnostics.some((x) => x.signal === 'NATIVE_CLOSE_ERROR' && x.error_code === 'ECONNRESET'));
+    assert.ok(!JSON.stringify(f.diagnostics).includes('private close detail'));
   } finally {
     await f.s.terminate();
   }

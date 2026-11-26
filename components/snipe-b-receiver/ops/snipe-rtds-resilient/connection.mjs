@@ -79,6 +79,7 @@ export class RtdsPeer {
     this.observationErrors = 0;
     this.phase = 'PREPARED';
     this.generation = 0;
+    this.session = null;
     this.sessions = [];
     this.gapHistogram = Array(GAP_BOUNDS_MS.length).fill(0);
     this.gapMaxMs = 0;
@@ -110,11 +111,12 @@ export class RtdsPeer {
   connect() {
     const m = this.mono();
     this.attempts = this.attempts.filter((x) => m - x < 600000);
-    if ((!this.continuous && this.generation >= this.maxConnections) || this.attempts.length >= 20) {
-      if (!this.continuous) {
-        this.stop('CONNECTION_BUDGET');
-        return;
-      }
+    const rollingBudgetExhausted = this.attempts.length >= 20;
+    if (!this.continuous && (this.generation >= this.maxConnections || rollingBudgetExhausted)) {
+      this.stop('CONNECTION_BUDGET');
+      return;
+    }
+    if (rollingBudgetExhausted) {
       this.phase = 'COOLDOWN';
       this.nextConnect = this.attempts[0] + 600000;
       this.emit('CONNECTION_COOLDOWN', { backoff_ms: Math.max(0, this.nextConnect - m) });
@@ -152,6 +154,8 @@ export class RtdsPeer {
     try {
       socket = this.socketFactory(RTDS_URL);
     } catch {
+      this.session = null;
+      this.phase = 'BACKOFF';
       this.schedule('CONSTRUCT_FAILED');
       return;
     }
@@ -176,6 +180,9 @@ export class RtdsPeer {
       }
     });
     add('message', (event) => {
+      // Optional A-buffer receipt. B/native sockets keep their existing behavior.
+      // It acknowledges this callback's pipeline decision, never a Telegram ACK.
+      const receipt = (status, reason) => event.complete?.(status, reason);
       const frameSeq = ++s.frameSeq;
       // Optional metadata-only observer. It cannot authorize a frame, throw into
       // the receiver, change liveness, or retain an unbounded input payload.
@@ -204,6 +211,7 @@ export class RtdsPeer {
       };
       if (!current()) {
         observed('OBSOLETE_CONNECTION_GENERATION');
+        receipt('DISCARDED', 'OBSOLETE_CONNECTION_GENERATION');
         return;
       }
       const m = this.mono();
@@ -215,6 +223,7 @@ export class RtdsPeer {
         const reason = typeof raw !== 'string' ? 'NON_TEXT' : 'FRAME_BUDGET';
         observed(reason);
         this.emit('FRAME_REJECTED', { reason });
+        receipt('DISCARDED', typeof raw !== 'string' ? 'FRAME_NON_TEXT' : 'FRAME_TOO_LARGE');
         return;
       }
       if (raw.toLowerCase() === 'pong' || raw.toLowerCase() === 'ping') {
@@ -226,6 +235,7 @@ export class RtdsPeer {
           rtt_ms: null,
           correlation: 'NOT_MEASURED'
         });
+        receipt('DISCARDED', 'APPLICATION_CONTROL');
         return;
       }
       let e;
@@ -234,6 +244,7 @@ export class RtdsPeer {
       } catch {
         observed(raw ? 'INVALID_JSON' : 'EMPTY_FRAME');
         if (raw) this.emit('FRAME_REJECTED', { reason: 'INVALID_JSON' });
+        receipt('DISCARDED', raw ? 'INVALID_JSON' : 'EMPTY_FRAME');
         return;
       }
       if (
@@ -243,13 +254,14 @@ export class RtdsPeer {
         typeof e.payload !== 'object' ||
         Array.isArray(e.payload)
       ) {
-        observed(
+        const reason =
           e?.topic !== 'activity'
             ? 'UNSUBSCRIBED_TOPIC'
             : !['trades', 'orders_matched'].includes(e.type)
               ? 'UNSUBSCRIBED_TYPE'
-              : 'INVALID_PAYLOAD_ENVELOPE'
-        );
+              : 'INVALID_PAYLOAD_ENVELOPE';
+        observed(reason);
+        receipt('DISCARDED', reason);
         return;
       }
       if (s.lastData !== null) {
@@ -274,7 +286,7 @@ export class RtdsPeer {
         });
       observed('ACTIVITY');
       try {
-        this.onActivity(
+        const result = this.onActivity(
           e,
           {
             source: this.source,
@@ -285,19 +297,39 @@ export class RtdsPeer {
             received_mono_ms: m,
             received_wall_ms: this.wall(),
             raw_bytes: Buffer.byteLength(raw),
-            raw_sha256: sha(raw)
+            raw_sha256: sha(raw),
+            ...(event.complete
+              ? { buffer_receipt_id: event.receipt_id ?? null, buffer_wait_ms: event.queue_wait_ms ?? null }
+              : {})
           },
           raw
         );
+        if (event.complete && result && typeof result.then === 'function') {
+          result.catch?.(() => {});
+          receipt('DISCARDED', 'PIPELINE_ASYNC_UNSUPPORTED');
+          this.reconnect('PIPELINE_ASYNC_UNSUPPORTED');
+          return;
+        }
+        receipt('PIPELINE_COMPLETED', 'COMMON_PIPELINE_RETURNED');
       } catch {
-        this.reconnect('ACTIVITY_ADAPTER_FAILED');
+        receipt('DISCARDED', 'PIPELINE_HANDLER_THROW');
+        this.reconnect(event.complete ? 'PIPELINE_HANDLER_THROW' : 'ACTIVITY_ADAPTER_FAILED');
       }
     });
-    add('error', () => {
+    add('error', (event) => {
       if (!current()) return;
       s.errors++;
-      this.emit('SOCKET_ERROR', { error_class: 'NOT_EXPOSED' });
-      this.reconnect('SOCKET_ERROR');
+      const reason =
+        event?.buffer_protocol === 'A_BUFFER_V1' &&
+        typeof event.reason === 'string' &&
+        /^[A-Z][A-Z0-9_]{0,80}$/.test(event.reason)
+          ? event.reason
+          : 'SOCKET_ERROR';
+      this.emit('SOCKET_ERROR', {
+        error_class: reason === 'SOCKET_ERROR' ? 'NOT_EXPOSED' : 'CLASSIFIED',
+        ...(reason === 'SOCKET_ERROR' ? {} : { reason })
+      });
+      this.reconnect(reason);
     });
     add('close', (event) => {
       if (s.closed) return;
@@ -316,8 +348,11 @@ export class RtdsPeer {
       if (this.session === s && this.phase !== 'STOPPED') {
         if (!s.closeRequest) {
           this.onDisconnect({ source: this.source, generation: s.generation });
-          this.schedule('REMOTE_OR_TRANSPORT_CLOSE');
-        } else if (!s.abortRequested) this.phase = 'BACKOFF';
+          if (this.phase !== 'STOPPED') {
+            this.phase = 'BACKOFF';
+            this.schedule('REMOTE_OR_TRANSPORT_CLOSE');
+          }
+        } else if (this.phase === 'WAIT_CLOSE') this.phase = 'BACKOFF';
       }
     });
   }
@@ -327,7 +362,6 @@ export class RtdsPeer {
   schedule(reason) {
     const delay = Math.min(5000, 500 * 2 ** Math.min(this.failures++, 4)) * (0.75 + 0.25 * this.random());
     this.nextConnect = this.mono() + delay;
-    this.phase = 'BACKOFF';
     this.emit('RECONNECT_SCHEDULED', { reason, backoff_ms: delay });
   }
   reconnect(reason) {
@@ -335,9 +369,10 @@ export class RtdsPeer {
     if (!s || s.closeRequest || this.phase === 'STOPPED') return;
     // Set the fence and recovery deadline before close(), including synchronous closes.
     s.closeRequest = { at: this.mono(), reason };
-    this.onDisconnect({ source: this.source, generation: s.generation });
-    this.schedule(reason);
     this.phase = 'WAIT_CLOSE';
+    this.schedule(reason);
+    this.onDisconnect({ source: this.source, generation: s.generation });
+    if (s.closed) return;
     this.emit('SOCKET_CLOSE_REQUEST', {
       reason,
       connection_age_ms: this.mono() - s.start,

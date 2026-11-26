@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
+import { Worker } from 'node:worker_threads';
+import { readFileSync } from 'node:fs';
 import { ManagedRtdsSocket } from './managed-socket.mjs';
 import { RtdsPeer, RTDS_URL } from './connection.mjs';
 const settle = () => new Promise((r) => setImmediate(r));
@@ -64,6 +66,77 @@ function fixture(extra = {}) {
     }
   };
 }
+test('socket factory failure clears the current session and permits a later attempt', () => {
+  let at = 0;
+  let calls = 0;
+  const peer = new RtdsPeer({
+    source: 'A',
+    mono: () => at,
+    random: () => 1,
+    socketFactory: () => {
+      if (++calls === 1) throw Error('FIXTURE_CONSTRUCT_ERROR');
+      return new Socket();
+    }
+  });
+  peer.start();
+  assert.equal(peer.phase, 'BACKOFF');
+  assert.equal(peer.session, null);
+  assert.equal(peer.health().connection_id, null);
+  at = 500;
+  peer.tick();
+  assert.equal(calls, 2);
+  assert.equal(peer.phase, 'CONNECTING');
+  assert.ok(peer.session?.socket);
+  peer.stop();
+});
+
+test('async close outlasts backoff without opening a replacement before confirmation', () => {
+  const phases = [];
+  const f = fixture({
+    closeGraceMs: 2000,
+    sink(row) {
+      if (row.kind === 'RECONNECT_SCHEDULED') {
+        phases.push(f.p.phase);
+        f.step(750);
+      }
+    }
+  });
+  const old = f.sockets[0];
+  old.confirm = false;
+  f.p.reconnect('TEST_ASYNC_CLOSE');
+  assert.deepEqual(phases, ['WAIT_CLOSE']);
+  assert.equal(f.p.phase, 'WAIT_CLOSE');
+  assert.equal(f.sockets.length, 1);
+  assert.equal(old.alive, true);
+  old.confirm = true;
+  old.close();
+  assert.equal(f.p.phase, 'BACKOFF');
+  assert.equal(f.p.health().next_connect_in_ms, 0);
+  f.step(0);
+  assert.equal(f.sockets.length, 2);
+  assert.equal(f.p.phase, 'CONNECTING');
+  f.p.stop();
+});
+
+for (const [name, maxConnections, expected] of [
+  ['lifetime', 2, 2],
+  ['rolling', 120, 20]
+])
+  test(`finite peer stops at the ${name} connection budget without a cooldown`, () => {
+    const f = fixture({ maxConnections });
+    for (let i = 0; i < expected; i++) {
+      f.p.reconnect('TEST');
+      f.step(5000);
+      if (f.p.phase === 'CONNECTING') f.sockets.at(-1).open();
+    }
+    assert.equal(f.sockets.length, expected);
+    assert.equal(f.p.phase, 'STOPPED');
+    assert.equal(f.p.health().stop_reason, 'CONNECTION_BUDGET');
+    assert.equal(f.p.health().next_connect_in_ms, null);
+    assert.ok(!f.rows.some((row) => row.kind === 'CONNECTION_COOLDOWN'));
+    f.step(600001);
+    assert.equal(f.sockets.length, expected);
+  });
 test('hung close is recovered only after a positive termination witness; obsolete callbacks stay fenced', async () => {
   const f = fixture({ continuous: true });
   const old = f.sockets[0],
@@ -228,5 +301,79 @@ test('actual offline worker enforces frame size and bounds its outstanding messa
     } finally {
       assert.equal(await socket.terminate(), true);
     }
+  }
+});
+
+function nativeWorker(t, fixture) {
+  const worker = new Worker(new URL('./socket-worker-fixture.mjs', import.meta.url), {
+    workerData: { url: RTDS_URL, fixture },
+    execArgv: [],
+    env: {}
+  });
+  const rows = [];
+  const errors = [];
+  worker.on('message', (row) => rows.push(row));
+  worker.on('error', (error) => errors.push(error));
+  const exit = new Promise((resolve) => worker.once('exit', resolve));
+  t.after(() => worker.terminate());
+  return { worker, rows, errors, exit };
+}
+
+test(
+  'native diagnostics are disposed before a constructor failure exits the worker',
+  { timeout: 5000 },
+  async (t) => {
+    const f = nativeWorker(t, 'CONSTRUCT_ERROR');
+    assert.equal(await f.exit, 1);
+    assert.deepEqual(
+      f.errors.map((error) => error.message),
+      ['FIXTURE_CONSTRUCT_ERROR']
+    );
+    assert.deepEqual(f.rows, [
+      { kind: 'fixture_subscribers', stage: 'constructor', active: 3 },
+      { kind: 'fixture_subscribers', stage: 'after_failure', active: 0 }
+    ]);
+  }
+);
+
+for (const command of [
+  { kind: 'close' },
+  { kind: 'send', data: 'fixture-large' },
+  { kind: 'send', data: 'fixture-native-error' }
+])
+  test(
+    `native close failure is diagnosed and the worker exits cleanly on ${command.data ?? command.kind}`,
+    { timeout: 5000 },
+    async (t) => {
+      const f = nativeWorker(t, 'CLOSE_ERROR');
+      const [opened] = await once(f.worker, 'message');
+      assert.equal(opened.kind, 'open');
+      f.worker.postMessage(command);
+      assert.equal(await f.exit, 0);
+      assert.deepEqual(f.errors, []);
+      assert.deepEqual(
+        f.rows.filter((row) => row.kind === 'diagnostic'),
+        [
+          {
+            kind: 'diagnostic',
+            value: { kind: 'NATIVE_CLOSE_ERROR', error_class: 'TypeError', error_code: 'ECONNRESET' }
+          }
+        ]
+      );
+      assert.deepEqual(
+        f.rows.filter((row) => row.kind === 'socket_close'),
+        [{ kind: 'socket_close', code: 1006, reason: '' }]
+      );
+    }
+  );
+
+test('the standalone B transport copies match the shared RTDS modules', () => {
+  for (const name of ['connection.mjs', 'managed-socket.mjs', 'socket-worker.mjs']) {
+    const shared = readFileSync(new URL('./' + name, import.meta.url), 'utf8');
+    const b = readFileSync(
+      new URL('../snipe-b-receiver/ops/snipe-rtds-resilient/' + name, import.meta.url),
+      'utf8'
+    );
+    assert.equal(b, shared, name + ' has diverged from the standalone B copy');
   }
 });

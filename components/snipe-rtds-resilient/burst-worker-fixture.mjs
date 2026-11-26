@@ -32,6 +32,7 @@ class OfflineSocket {
   constructor() {
     this.listeners = new Map();
     this.hang = false;
+    this.throwOnClose = false;
     queueMicrotask(() => this.emit('open'));
   }
   addEventListener(kind, fn) {
@@ -42,6 +43,7 @@ class OfflineSocket {
     for (const fn of this.listeners.get(kind) ?? []) fn(row);
   }
   close() {
+    if (this.throwOnClose) throw Object.assign(new TypeError('private close detail'), { code: 'ECONNRESET' });
     if (!this.hang) queueMicrotask(() => this.emit('close', { code: 1000, reason: '' }));
   }
   send(text) {
@@ -61,12 +63,14 @@ class OfflineSocket {
     if (x.fixture === 'LARGE') this.emit('message', { data: 'x'.repeat(262145) });
     if (x.fixture === 'NON_TEXT') this.emit('message', { data: new Uint8Array(4) });
     if (x.fixture === 'HANG_CLOSE') this.hang = true;
+    if (x.fixture === 'THROW_ON_CLOSE') this.throwOnClose = true;
     if (x.fixture === 'NATIVE_CLOSE') this.close();
-    if (x.fixture === 'NATIVE_ERROR') {
+    if (x.fixture === 'NATIVE_ERROR' || x.fixture === 'NATIVE_ERROR_WITHOUT_CLOSE') {
+      if (x.fixture === 'NATIVE_ERROR_WITHOUT_CLOSE') this.hang = true;
       this.emit('error', {
         error: Object.assign(new TypeError('private-token-or-address'), { code: 'ECONNRESET' })
       });
-      this.close();
+      if (x.fixture === 'NATIVE_ERROR') this.close();
     }
     if (x.fixture === 'SEND_ERROR') throw Error('private-token-or-address');
   }
