@@ -40,6 +40,8 @@ See the [operating guide](docs/operation.md) for configuration and the requireme
 
 The [unit templates](deploy/systemd/) cover V1, FAST and the independent B receiver. Install the pinned dependencies, build V1, and fill in the service user, checkout path and private environment file for each selected unit. Follow the [systemd setup](docs/operation.md#systemd) to verify the units and install them on the intended hosts.
 
+The [B runtime subtree](components/snipe-b-receiver/ops/) contains the modules needed to run B on its own host. Its RTDS connection, managed socket and native worker are synchronized with the shared RTDS modules so that the subtree can be deployed on its own.
+
 ## Delivery behavior
 
 - V1 stores the checkpoint and queued alerts together. Unsubscribing cancels pending alerts in the same operation. Alerts keep their order within each chat, with at most ten delivery attempts per row.

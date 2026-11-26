@@ -184,6 +184,49 @@ function claimed(f) {
     claimToken: 'fixture-claim'
   };
 }
+test('claim and send checks reuse prepared statements while reading live delivery state', () => {
+  const f = fixture();
+  try {
+    const row = claimed(f);
+    f.db.prepare = () => assert.fail('hot guard prepared another statement');
+    assert.equal(f.gate.beforeSend(row, 0).allow, true);
+    f.db.exec("UPDATE deliveries SET state='PENDING',claim_token=NULL");
+    assert.equal(f.gate.beforeClaim(row, 0).allow, true);
+    assert.equal(f.gate.beforeSend(row, 0).reason, 'CURRENT_SEND_CLAIM_REQUIRED');
+  } finally {
+    f.close();
+  }
+});
+
+for (const [stage, stopReason] of [
+  ['beforeClaim', 'RTDS_DIRECT_CLAIM_SAFETY_STOP'],
+  ['beforeSend', 'RTDS_DIRECT_BEFORE_SEND_SAFETY_STOP']
+])
+  test(`${stage} fails closed for a non-array identity even when its index zero matches the wallet`, () => {
+    const f = fixture();
+    try {
+      const row = claimed(f);
+      if (stage === 'beforeClaim') f.db.exec("UPDATE deliveries SET state='PENDING',claim_token=NULL");
+      const readDelivery = f.db.prepare('SELECT state,claim_token FROM deliveries');
+      const delivery = readDelivery.get();
+      f.db.prepare('UPDATE send_once_actions SET identity_json=?').run(JSON.stringify({ 0: row.wallet }));
+      const transactions = [];
+      const exec = f.db.exec.bind(f.db);
+      f.db.exec = (sql) => {
+        transactions.push(sql);
+        return exec(sql);
+      };
+      assert.deepEqual(f.gate[stage](row, 0), { allow: false, reason: 'ACTION_RESERVATION_REQUIRED' });
+      assert.equal(f.disabled, stopReason);
+      assert.deepEqual(transactions, stage === 'beforeSend' ? ['BEGIN IMMEDIATE', 'ROLLBACK'] : []);
+      assert.equal(f.db.inTransaction, false);
+      assert.deepEqual(readDelivery.get(), delivery);
+      assert.equal(f.db.prepare('SELECT COUNT(*) n FROM send_once_actions').get().n, 1);
+    } finally {
+      f.close();
+    }
+  });
+
 for (const ms of [1999, 2000, 2000.01])
   test(`final pre-transport guard includes earlier IO and lock time: ${ms}ms`, () => {
     const f = fixture();

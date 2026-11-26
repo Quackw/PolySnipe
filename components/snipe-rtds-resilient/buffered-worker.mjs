@@ -9,6 +9,7 @@ if (!isMainThread) {
   let socket,
     timer,
     closing = false,
+    closeRequested = false,
     nativeEnd = null,
     pendingError = null,
     finished = false,
@@ -27,14 +28,24 @@ if (!isMainThread) {
       parentPort.close();
     });
   };
+  const closeSocket = () => {
+    if (!socket || closeRequested) return;
+    closeRequested = true;
+    try {
+      socket.close();
+    } catch (error) {
+      post({ kind: 'diagnostic', value: { kind: 'NATIVE_CLOSE_ERROR', ...safeSocketError(error) } });
+      nativeEnd ??= { code: 1006 };
+    }
+  };
   const fault = (reason) => {
     if (!FRAME_FAILURES.has(reason)) reason = 'WORKER_PROTOCOL_ERROR';
     pendingError = reason;
     closing = true;
     post({ kind: 'transport_fault', reason });
-    try {
-      socket?.close();
-    } catch {}
+    closeSocket();
+    // A drain failure after a native error can finish without a native close event.
+    finish();
   };
   const buffer = createFrameBuffer({ post, onFault: fault, onDrained: finish, limits: workerData.limits });
   const dispose = attachNativeDiagnostics((value) => post({ kind: 'diagnostic', value }));
@@ -49,13 +60,12 @@ if (!isMainThread) {
     socket.addEventListener('open', () => post({ kind: 'open' }));
     socket.addEventListener('message', (event) => buffer.accept(event.data));
     socket.addEventListener('error', (event) => {
-      pendingError = 'NATIVE_SOCKET_ERROR';
+      pendingError ??= 'NATIVE_SOCKET_ERROR';
       post({ kind: 'diagnostic', value: { kind: 'NATIVE_SOCKET_ERROR', ...safeSocketError(event?.error) } });
       nativeEnd ??= { code: 1006 };
       buffer.end();
-      try {
-        socket.close();
-      } catch {}
+      closeSocket();
+      if (buffer.snapshot().failed) finish();
     });
     socket.addEventListener('close', (event) => {
       nativeEnd = { code: Number.isInteger(event.code) ? event.code : 1006 };
@@ -77,14 +87,14 @@ if (!isMainThread) {
       if (frame?.kind === 'close') {
         closing = true;
         buffer.cancel('SOURCE_GENERATION_FENCED');
-        try {
-          socket.close();
-        } catch {}
+        closeSocket();
+        finish();
         return;
       }
       if (
         frame?.kind === 'send' &&
         !closing &&
+        nativeEnd === null &&
         typeof frame.data === 'string' &&
         Buffer.byteLength(frame.data) <= 16384
       ) {

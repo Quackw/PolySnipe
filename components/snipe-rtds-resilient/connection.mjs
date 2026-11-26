@@ -79,6 +79,7 @@ export class RtdsPeer {
     this.observationErrors = 0;
     this.phase = 'PREPARED';
     this.generation = 0;
+    this.session = null;
     this.sessions = [];
     this.gapHistogram = Array(GAP_BOUNDS_MS.length).fill(0);
     this.gapMaxMs = 0;
@@ -110,11 +111,12 @@ export class RtdsPeer {
   connect() {
     const m = this.mono();
     this.attempts = this.attempts.filter((x) => m - x < 600000);
-    if ((!this.continuous && this.generation >= this.maxConnections) || this.attempts.length >= 20) {
-      if (!this.continuous) {
-        this.stop('CONNECTION_BUDGET');
-        return;
-      }
+    const rollingBudgetExhausted = this.attempts.length >= 20;
+    if (!this.continuous && (this.generation >= this.maxConnections || rollingBudgetExhausted)) {
+      this.stop('CONNECTION_BUDGET');
+      return;
+    }
+    if (rollingBudgetExhausted) {
       this.phase = 'COOLDOWN';
       this.nextConnect = this.attempts[0] + 600000;
       this.emit('CONNECTION_COOLDOWN', { backoff_ms: Math.max(0, this.nextConnect - m) });
@@ -152,6 +154,8 @@ export class RtdsPeer {
     try {
       socket = this.socketFactory(RTDS_URL);
     } catch {
+      this.session = null;
+      this.phase = 'BACKOFF';
       this.schedule('CONSTRUCT_FAILED');
       return;
     }
@@ -294,8 +298,9 @@ export class RtdsPeer {
             received_wall_ms: this.wall(),
             raw_bytes: Buffer.byteLength(raw),
             raw_sha256: sha(raw),
-            buffer_receipt_id: event.receipt_id ?? null,
-            buffer_wait_ms: event.queue_wait_ms ?? null
+            ...(event.complete
+              ? { buffer_receipt_id: event.receipt_id ?? null, buffer_wait_ms: event.queue_wait_ms ?? null }
+              : {})
           },
           raw
         );
@@ -343,8 +348,11 @@ export class RtdsPeer {
       if (this.session === s && this.phase !== 'STOPPED') {
         if (!s.closeRequest) {
           this.onDisconnect({ source: this.source, generation: s.generation });
-          this.schedule('REMOTE_OR_TRANSPORT_CLOSE');
-        } else if (!s.abortRequested) this.phase = 'BACKOFF';
+          if (this.phase !== 'STOPPED') {
+            this.phase = 'BACKOFF';
+            this.schedule('REMOTE_OR_TRANSPORT_CLOSE');
+          }
+        } else if (this.phase === 'WAIT_CLOSE') this.phase = 'BACKOFF';
       }
     });
   }
@@ -354,7 +362,6 @@ export class RtdsPeer {
   schedule(reason) {
     const delay = Math.min(5000, 500 * 2 ** Math.min(this.failures++, 4)) * (0.75 + 0.25 * this.random());
     this.nextConnect = this.mono() + delay;
-    this.phase = 'BACKOFF';
     this.emit('RECONNECT_SCHEDULED', { reason, backoff_ms: delay });
   }
   reconnect(reason) {
@@ -362,9 +369,10 @@ export class RtdsPeer {
     if (!s || s.closeRequest || this.phase === 'STOPPED') return;
     // Set the fence and recovery deadline before close(), including synchronous closes.
     s.closeRequest = { at: this.mono(), reason };
-    this.onDisconnect({ source: this.source, generation: s.generation });
-    this.schedule(reason);
     this.phase = 'WAIT_CLOSE';
+    this.schedule(reason);
+    this.onDisconnect({ source: this.source, generation: s.generation });
+    if (s.closed) return;
     this.emit('SOCKET_CLOSE_REQUEST', {
       reason,
       connection_age_ms: this.mono() - s.start,
