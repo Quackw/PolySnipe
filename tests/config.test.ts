@@ -10,7 +10,9 @@ beforeEach(() => {
     "HTTP_RETRIES",
     "POLYMARKET_TIMEOUT_MS",
     "POLYMARKET_RETRIES",
-    "TELEGRAM_TIMEOUT_MS"
+    "TELEGRAM_TIMEOUT_MS",
+    "V1_PAGE_BUDGET_RESYNC_AFTER",
+    "PRUNE_BLOCKED_CHAT_AFTER_REJECTS"
   ])
     vi.stubEnv(name, undefined);
 });
@@ -25,7 +27,9 @@ it.each([undefined, "", "   "])(
       "HTTP_RETRIES",
       "POLYMARKET_TIMEOUT_MS",
       "POLYMARKET_RETRIES",
-      "TELEGRAM_TIMEOUT_MS"
+      "TELEGRAM_TIMEOUT_MS",
+      "V1_PAGE_BUDGET_RESYNC_AFTER",
+      "PRUNE_BLOCKED_CHAT_AFTER_REJECTS"
     ])
       vi.stubEnv(name, value);
     expect(loadConfig()).toMatchObject({
@@ -35,7 +39,9 @@ it.each([undefined, "", "   "])(
       httpRetries: 2,
       polymarketTimeoutMs: 15_000,
       polymarketRetries: 1,
-      telegramTimeoutMs: 15_000
+      telegramTimeoutMs: 15_000,
+      pageBudgetResyncAfter: 3,
+      pruneBlockedChatAfterRejects: 3
     });
   }
 );
@@ -55,12 +61,25 @@ it("inherits supplied legacy HTTP values, including zero retries, and accepts ex
   expect(loadConfig().polymarketRetries).toBe(3);
 });
 
-it.each(["SCHEDULER_TICK_MS", "HTTP_TIMEOUT_MS", "HTTP_RETRIES", "POLYMARKET_RETRIES"])(
-  "rejects malformed and out-of-range integers in %s",
-  (name) => {
-    for (const value of ["10abc", "10.5", "-1", "0x10", "9007199254740992"]) {
-      vi.stubEnv(name, value);
-      expect(loadConfig).toThrow(name);
-    }
+it("accepts zero and explicit positive thresholds for both V1 policies", () => {
+  vi.stubEnv("V1_PAGE_BUDGET_RESYNC_AFTER", "0");
+  vi.stubEnv("PRUNE_BLOCKED_CHAT_AFTER_REJECTS", "5");
+  expect(loadConfig()).toMatchObject({ pageBudgetResyncAfter: 0, pruneBlockedChatAfterRejects: 5 });
+  vi.stubEnv("V1_PAGE_BUDGET_RESYNC_AFTER", "2");
+  vi.stubEnv("PRUNE_BLOCKED_CHAT_AFTER_REJECTS", "0");
+  expect(loadConfig()).toMatchObject({ pageBudgetResyncAfter: 2, pruneBlockedChatAfterRejects: 0 });
+});
+
+it.each([
+  "SCHEDULER_TICK_MS",
+  "HTTP_TIMEOUT_MS",
+  "HTTP_RETRIES",
+  "POLYMARKET_RETRIES",
+  "V1_PAGE_BUDGET_RESYNC_AFTER",
+  "PRUNE_BLOCKED_CHAT_AFTER_REJECTS"
+])("rejects malformed and out-of-range integers in %s", (name) => {
+  for (const value of ["10abc", "10.5", "-1", "0x10", "9007199254740992"]) {
+    vi.stubEnv(name, value);
+    expect(loadConfig).toThrow(name);
   }
-);
+});

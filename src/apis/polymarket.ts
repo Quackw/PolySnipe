@@ -7,7 +7,7 @@ import type {
   ResolvedAccount,
   UserActivity
 } from "../types.js";
-import { buildActivityKey, filterAllowedActivities } from "../services/activity.js";
+import { buildActivityKey, filterAllowedActivities, MAX_WATERMARK_KEYS } from "../services/activity.js";
 import type { ParsedAccountInput } from "../subscriptionInput.js";
 
 const GAMMA_BASE_URL = "https://gamma-api.polymarket.com";
@@ -210,6 +210,19 @@ function parseActivityPage(raw: unknown): { activities: UserActivity[]; nextCurs
   return { activities: parseUserActivity(page.data, "v2"), nextCursor };
 }
 
+export class V2ActivityPageBudgetExhaustedError extends Error {
+  public constructor(
+    public readonly head: { timestamp: number; keys: string[] } | null,
+    public readonly limit: "pages" | "watermark_keys" = "pages"
+  ) {
+    super(
+      limit === "pages"
+        ? "V2 activity page budget exhausted; refusing partial poll"
+        : "Activity timestamp exceeds persisted watermark capacity"
+    );
+  }
+}
+
 export interface ResolveActivityHooks {
   bootstrapOnly?: boolean;
   onRetry?: (() => void) | undefined;
@@ -290,6 +303,7 @@ export class DefaultPolymarketClient implements PolymarketClient {
     let throttleWaitMs = 0;
     let cursor: string | undefined;
     const seenCursors = new Set<string>();
+    let head: V2ActivityPageBudgetExhaustedError["head"] = null;
 
     for (let page = 0; page < this.config.activityMaxPages; page += 1) {
       const params = new URLSearchParams({
@@ -332,6 +346,11 @@ export class DefaultPolymarketClient implements PolymarketClient {
         out.push(row);
       }
       const allowed = filterAllowedActivities(out);
+      if (page === 0 && out[0] !== undefined) {
+        const timestamp = out[0].timestamp;
+        const keys = [...new Set(allowed.filter((row) => row.timestamp === timestamp).map(buildActivityKey))];
+        head = { timestamp, keys: keys.slice(0, MAX_WATERMARK_KEYS) };
+      }
       const latest = allowed[0]?.timestamp;
       // Bootstrap sends no history. Stop only after the entire newest timestamp
       // group is covered (including across page boundaries), not after a row count.
@@ -344,8 +363,11 @@ export class DefaultPolymarketClient implements PolymarketClient {
       // Docs checked 2026-10-23: only explicit null means complete, even on empty/short pages.
       if (activityPage.nextCursor === null || bootstrapCovered) {
         const activities = allowed.sort((a, b) => b.timestamp - a.timestamp);
-        if (new Set(activities.filter((row) => row.timestamp === latest).map(buildActivityKey)).size > 500) {
-          throw new Error("Activity timestamp exceeds persisted watermark capacity");
+        if (
+          new Set(activities.filter((row) => row.timestamp === latest).map(buildActivityKey)).size >
+          MAX_WATERMARK_KEYS
+        ) {
+          throw new V2ActivityPageBudgetExhaustedError(head, "watermark_keys");
         }
         return { activities, apiCalls, retries, throttleWaitMs };
       }
@@ -354,7 +376,7 @@ export class DefaultPolymarketClient implements PolymarketClient {
     }
 
     // Throw before the scheduler can persist a watermark or send from an incomplete traversal.
-    throw new Error("V2 activity page budget exhausted; refusing partial poll");
+    throw new V2ActivityPageBudgetExhaustedError(head);
   }
 
   private async fetchPublicProfile(address: string): Promise<PublicProfile | null> {

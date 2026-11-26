@@ -53,6 +53,11 @@ export function ensureSchema(db: Database.Database): void {
       updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     );
 
+    CREATE TABLE IF NOT EXISTS chat_unavailable_streaks (
+      chat_id INTEGER PRIMARY KEY,
+      consecutive_rejects INTEGER NOT NULL CHECK(consecutive_rejects > 0)
+    );
+
     CREATE TABLE IF NOT EXISTS tracked_accounts (
       proxy_address          TEXT PRIMARY KEY,
       name                   TEXT,
@@ -60,9 +65,11 @@ export function ensureSchema(db: Database.Database): void {
       profile_slug           TEXT,
       last_seen_timestamp    INTEGER NOT NULL DEFAULT 0,
       last_seen_keys_json    TEXT NOT NULL DEFAULT '[]',
+      skip_activity_through_timestamp INTEGER NOT NULL DEFAULT 0,
       last_polled_at_ms      INTEGER,
       next_poll_at_ms        INTEGER NOT NULL DEFAULT 0,
       consecutive_errors     INTEGER NOT NULL DEFAULT 0,
+      consecutive_page_budget_exhaustions INTEGER NOT NULL DEFAULT 0,
       inflight               INTEGER NOT NULL DEFAULT 0 CHECK (inflight IN (0, 1)),
       inflight_started_at_ms INTEGER,
       created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -138,6 +145,18 @@ export function ensureSchema(db: Database.Database): void {
       ON alert_delay_samples(send_started_at_ms DESC);
   `);
 
+  ensureOptionalColumn(
+    db,
+    "tracked_accounts",
+    "skip_activity_through_timestamp",
+    "INTEGER NOT NULL DEFAULT 0"
+  );
+  ensureOptionalColumn(
+    db,
+    "tracked_accounts",
+    "consecutive_page_budget_exhaustions",
+    "INTEGER NOT NULL DEFAULT 0"
+  );
   ensureOptionalColumn(db, "alert_delay_samples", "poll_started_at_ms", "INTEGER");
   ensureOptionalColumn(db, "alert_delay_samples", "fetch_completed_at_ms", "INTEGER");
   ensureOptionalColumn(db, "alert_delay_samples", "send_completed_at_ms", "INTEGER");

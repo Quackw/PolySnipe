@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DefaultPolymarketClient, parseUserActivity } from "../src/apis/polymarket.js";
+import {
+  DefaultPolymarketClient,
+  parseUserActivity,
+  V2ActivityPageBudgetExhaustedError
+} from "../src/apis/polymarket.js";
 import { buildActivityKey, updateWatermarkState } from "../src/services/activity.js";
 import { SlidingWindowRateGate } from "../src/utils/rateGate.js";
 import { testConfig } from "./helpers.js";
@@ -179,6 +183,41 @@ describe("activity v2 contract", () => {
     const b = clientWith([page([row()], "a")], { activityMaxPages: 1 });
     await expect(b.client.fetchRecentUserActivity(wallet, 100, 200)).rejects.toThrow(/budget/);
   });
+  it("carries the first-page head without a repeated request or keys from later pages", async () => {
+    const first = row(120, { transaction_hash: "0xfirst" });
+    const later = row(120, { transaction_hash: "0xlater" });
+    const { client, fetchMock } = clientWith([page([first, first], "a"), page([later], "b")], {
+      activityMaxPages: 2
+    });
+    const error = await client.fetchRecentUserActivity(wallet, 100, 200).catch((failure) => failure);
+    expect(error).toBeInstanceOf(V2ActivityPageBudgetExhaustedError);
+    expect(error).toMatchObject({
+      limit: "pages",
+      head: { timestamp: 120, keys: [buildActivityKey(parseUserActivity([first], "v2")[0]!)] }
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("exposes no resync head if page one was empty", async () => {
+    const { client } = clientWith([page([], "a"), page([row()], "b")], { activityMaxPages: 2 });
+    await expect(client.fetchRecentUserActivity(wallet, 100, 200)).rejects.toMatchObject({ head: null });
+  });
+
+  it("handles a full timestamp group over 500 keys as a resync-eligible failure", async () => {
+    const activities = Array.from({ length: 501 }, (_, i) => row(120, { transaction_hash: "fixture-" + i }));
+    const { client, fetchMock } = clientWith(
+      [page(activities.slice(0, 500), "a"), page(activities.slice(500))],
+      {
+        activityPageLimit: 500
+      }
+    );
+    const error = await client.fetchRecentUserActivity(wallet, 100, 200).catch((failure) => failure);
+    expect(error).toBeInstanceOf(V2ActivityPageBudgetExhaustedError);
+    expect(error).toMatchObject({ limit: "watermark_keys", head: { timestamp: 120 } });
+    expect(error.head.keys).toHaveLength(500);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects a missing terminal cursor after a valid page", async () => {
     const { client, fetchMock } = clientWith([
       page([row()], "a"),

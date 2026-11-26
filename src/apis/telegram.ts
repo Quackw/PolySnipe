@@ -9,10 +9,23 @@ export interface TelegramSenderOptions {
 export class TelegramRejectedError extends Error {
   constructor(
     public readonly code: number,
-    public readonly retryAfterMs = 0
+    public readonly retryAfterMs = 0,
+    public readonly description = ""
   ) {
     super(`Telegram rejected send: ${code}`);
   }
+}
+
+export function isPermanentChatUnavailableError(error: unknown): boolean {
+  if (!(error instanceof TelegramRejectedError)) return false;
+
+  const description = error.description.trim().toLowerCase();
+  if (error.code === 403) {
+    return /^(?:forbidden:\s*)?(?:bot was blocked by the user|user is deactivated|bot was kicked from (?:the )?(?:group|supergroup|channel)(?: chat)?)\.?$/.test(
+      description
+    );
+  }
+  return error.code === 400 && /^(?:bad request:\s*)?chat not found\.?$/.test(description);
 }
 
 export type TelegramSender = (chatId: number, text: string) => Promise<void>;
@@ -56,6 +69,7 @@ async function sendMessage(token: string, chatId: number, text: string, timeoutM
     const body = (await response.json()) as {
       ok?: unknown;
       error_code?: unknown;
+      description?: unknown;
       parameters?: { retry_after?: unknown };
       result?: { message_id?: unknown; chat?: { id?: unknown } };
     };
@@ -70,7 +84,8 @@ async function sendMessage(token: string, chatId: number, text: string, timeoutM
       const seconds = body.parameters?.retry_after;
       throw new TelegramRejectedError(
         body.error_code,
-        typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 30000
+        typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 30000,
+        typeof body.description === "string" ? body.description : ""
       );
     }
     if (
