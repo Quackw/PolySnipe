@@ -18,6 +18,8 @@ V1 skips an exhausted activity window after `V1_PAGE_BUDGET_RESYNC_AFTER` consec
 
 Use `pnpm run test:components` to exercise the receive workers, shared sender and bridge with temporary data. It makes no requests to Telegram or Polymarket.
 
+In continuous worker mode, `ABORT_NOT_CONFIRMED` leaves the peer in `WAIT_ABORT` with its current connection fenced. `ABORT_CONFIRMED` with `late: true` records the worker exit that releases the peer back to its reconnect schedule. An explicit stop is terminal, even if the worker exits later.
+
 A live setup needs a private FAST state directory and subscription database, a pinned bot identity, an authenticated B bridge, and an approved subscription scope. FAST requires `POLYSNIPE_FAST_ENABLE=1`, an absolute `POLYSNIPE_FAST_STATE_DIR` owned by its process user with mode `0700`, `TELEGRAM_BOT_TOKEN`, `EXPECTED_TELEGRAM_USERNAME` and the owner configuration. It verifies the bot identity before opening a market stream. The `ENABLE_CANARY` and `FAST_DISABLED` markers are operator-owned state. FAST REDEEM and recovery default to off.
 
 B requires `POLYSNIPE_B_ENABLE=1` and an absolute `POLYSNIPE_B_STATE_DIR` owned by its process user with mode `0700`. Its config, frozen scope, pinned hosts and key material are private files in that directory. The forced SSH command relays only to the fixed private FAST socket. Use a restricted account for the bridge.

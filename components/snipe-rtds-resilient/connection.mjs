@@ -385,12 +385,39 @@ export class RtdsPeer {
       this.stop('CLOSE_CALL_FAILED');
     }
   }
+  abortNotConfirmed(s) {
+    if (s.abortUnconfirmed) return;
+    const workerExit = s.socket.exit;
+    if (!this.continuous || typeof workerExit?.then !== 'function') {
+      this.stop('ABORT_NOT_CONFIRMED');
+      return;
+    }
+    s.abortUnconfirmed = true;
+    this.emit('ABORT_NOT_CONFIRMED', { connection_id: s.id, waiting_for: 'WORKER_EXIT' });
+    // The worker adapters resolve exit only after the worker has stopped.
+    // Watch it independently of the terminate request and socket-close messages.
+    Promise.resolve(workerExit)
+      .then((confirmed) => {
+        if (confirmed === true) this.confirmAbort(s);
+      })
+      .catch(() => {
+        if (this.session === s && this.phase === 'WAIT_ABORT') this.stop('ABORT_FAILED');
+      });
+  }
+  confirmAbort(s) {
+    if (this.session !== s || this.phase !== 'WAIT_ABORT') return;
+    s.closed = true;
+    this.detach(s);
+    this.session = null;
+    this.phase = 'BACKOFF';
+    this.emit('ABORT_CONFIRMED', { connection_id: s.id, late: s.abortUnconfirmed === true });
+  }
   tick() {
     if (['PREPARED', 'STOPPED'].includes(this.phase)) return;
     const m = this.mono(),
       s = this.session;
     if (this.phase === 'WAIT_ABORT') {
-      if (m - s.abortRequested >= this.abortGraceMs) this.stop('ABORT_NOT_CONFIRMED');
+      if (!s.abortUnconfirmed && m - s.abortRequested >= this.abortGraceMs) this.abortNotConfirmed(s);
       return;
     }
     if (this.phase === 'WAIT_CLOSE') {
@@ -412,17 +439,12 @@ export class RtdsPeer {
           .then(() => s.socket.terminate())
           .then((confirmed) => {
             if (this.session !== s || this.phase !== 'WAIT_ABORT') return;
-            if (confirmed !== true) {
-              this.stop('ABORT_NOT_CONFIRMED');
-              return;
-            }
-            s.closed = true;
-            this.detach(s);
-            this.emit('ABORT_CONFIRMED', { connection_id: s.id });
-            this.phase = 'BACKOFF';
+            if (confirmed === true) this.confirmAbort(s);
+            else this.abortNotConfirmed(s);
           })
           .catch(() => {
-            if (this.session === s && this.phase === 'WAIT_ABORT') this.stop('ABORT_FAILED');
+            if (this.session === s && this.phase === 'WAIT_ABORT' && !s.abortUnconfirmed)
+              this.stop('ABORT_FAILED');
           });
       }
       return;
@@ -471,6 +493,7 @@ export class RtdsPeer {
       source: this.source,
       phase: this.phase,
       stop_reason: this.reason ?? null,
+      abort_pending_reason: this.phase === 'WAIT_ABORT' && s?.abortUnconfirmed ? 'ABORT_NOT_CONFIRMED' : null,
       recovery_mode: this.continuous ? 'CONTINUOUS_BOUNDED' : 'FINITE',
       next_connect_in_ms: ['BACKOFF', 'COOLDOWN'].includes(this.phase)
         ? Math.max(0, this.nextConnect - m)
